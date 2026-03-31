@@ -56,7 +56,7 @@ def main() -> None:
         statuses = Counter(str(record.get("status_code")) for record in related if record.get("status_code") is not None)
         request_kinds = Counter(str(record.get("request_kind")) for record in related if record.get("request_kind"))
         note = ""
-        if request_count and request_kinds.get("responses_http", 0) == 0:
+        if request_count and request_kinds.get("responses_http", 0) == 0 and request_kinds.get("responses_websocket", 0) == 0:
             note = " note=no_http_post_seen"
         print(
             f"{run_id} {run['status']} exit={run['exit_code']} "

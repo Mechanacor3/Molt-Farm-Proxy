@@ -46,6 +46,8 @@ def test_build_codex_command_preserves_explicit_resume_session_id() -> None:
 
 def test_failure_classification_covers_expected_paths() -> None:
     assert classify_proxy_failure(405, "websocket_not_supported", "GET") == "transport_failure"
+    assert classify_proxy_failure(200, None, "GET", "responses_websocket") is None
+    assert classify_proxy_failure(400, "request_parse_error", "GET", "responses_websocket") == "transport_failure"
     assert classify_proxy_failure(400, "request_validation_error", "POST") == "schema_mismatch"
     assert classify_proxy_failure(400, "request_parse_error", "POST") == "schema_mismatch"
     assert classify_proxy_failure(400, "unsupported_tool", "POST") == "unsupported_tool"

@@ -5,14 +5,15 @@ import logging
 from io import BytesIO
 from contextlib import asynccontextmanager
 from time import perf_counter
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.websockets import WebSocketDisconnect
 import zstandard as zstd
 
 from app.errors import ProxyError
@@ -21,7 +22,12 @@ from app.jsonl import append_jsonl, utc_now_iso
 from app.ollama_client import OllamaClient
 from app.schemas_responses import ResponsesRequest
 from app.settings import Settings, get_settings
-from app.translator import build_sse_events, translate_chat_response_to_responses, translate_responses_request_to_chat
+from app.translator import (
+    build_response_events,
+    build_sse_events,
+    translate_chat_response_to_responses,
+    translate_responses_request_to_chat,
+)
 
 logger = logging.getLogger("molt_farm_proxy")
 
@@ -44,6 +50,7 @@ def get_ollama_client(request: Request) -> OllamaClient:
 def _request_log_payload(request: Request, response_status: int, settings: Settings) -> dict[str, object]:
     request_body = getattr(request.state, "parsed_json_body", None)
     error_code = getattr(request.state, "error_code", None)
+    request_kind = getattr(request.state, "request_kind", None)
     payload = {
         "timestamp": utc_now_iso(),
         "request_id": getattr(request.state, "request_id", None),
@@ -54,11 +61,14 @@ def _request_log_payload(request: Request, response_status: int, settings: Setti
         "latency_ms": getattr(request.state, "latency_ms", None),
         "model": getattr(request.state, "downstream_model", None),
         "stream": getattr(request.state, "stream", None),
-        "request_kind": "responses_websocket_probe"
-        if request.method == "GET" and request.url.path == "/v1/responses"
-        else "responses_http",
+        "request_kind": request_kind
+        or (
+            "responses_websocket_probe"
+            if request.method == "GET" and request.url.path == "/v1/responses"
+            else "responses_http"
+        ),
         "error_code": error_code,
-        "failure_class": classify_proxy_failure(response_status, error_code, request.method),
+        "failure_class": classify_proxy_failure(response_status, error_code, request.method, request_kind),
     }
     tool_summary = getattr(request.state, "tool_summary", None)
     if tool_summary is not None:
@@ -66,6 +76,43 @@ def _request_log_payload(request: Request, response_status: int, settings: Setti
     upstream_summary = getattr(request.state, "upstream_summary", None)
     if upstream_summary is not None:
         payload["upstream_summary"] = upstream_summary
+    if settings.debug_payload_logging and request_body is not None:
+        payload["request_body"] = request_body
+    return payload
+
+
+def _websocket_log_payload(websocket: WebSocket, settings: Settings) -> dict[str, object]:
+    request_body = getattr(websocket.state, "parsed_json_body", None)
+    error_code = getattr(websocket.state, "error_code", None)
+    payload = {
+        "timestamp": utc_now_iso(),
+        "request_id": getattr(websocket.state, "request_id", None),
+        "bridge_run_id": getattr(websocket.state, "bridge_run_id", None),
+        "method": "GET",
+        "path": websocket.url.path,
+        "status_code": getattr(websocket.state, "status_code", None),
+        "latency_ms": getattr(websocket.state, "latency_ms", None),
+        "model": getattr(websocket.state, "downstream_model", None),
+        "stream": getattr(websocket.state, "stream", None),
+        "request_kind": getattr(websocket.state, "request_kind", "responses_websocket"),
+        "error_code": error_code,
+        "failure_class": classify_proxy_failure(
+            getattr(websocket.state, "status_code", None),
+            error_code,
+            "GET",
+            getattr(websocket.state, "request_kind", "responses_websocket"),
+        ),
+        "websocket_status": getattr(websocket.state, "websocket_status", None),
+    }
+    tool_summary = getattr(websocket.state, "tool_summary", None)
+    if tool_summary is not None:
+        payload["tool_summary"] = tool_summary
+    upstream_summary = getattr(websocket.state, "upstream_summary", None)
+    if upstream_summary is not None:
+        payload["upstream_summary"] = upstream_summary
+    websocket_headers = getattr(websocket.state, "websocket_headers", None)
+    if websocket_headers is not None:
+        payload["websocket_headers"] = websocket_headers
     if settings.debug_payload_logging and request_body is not None:
         payload["request_body"] = request_body
     return payload
@@ -119,6 +166,14 @@ def _summarize_tools(parsed: object) -> list[dict[str, object]] | None:
     return summary
 
 
+def _redact_websocket_headers(headers: list[tuple[str, str]]) -> dict[str, str]:
+    sensitive = {"authorization", "cookie", "sec-websocket-key"}
+    return {
+        key.lower(): ("[redacted]" if key.lower() in sensitive else value)
+        for key, value in headers
+    }
+
+
 def _decode_request_body(raw_body: bytes, content_encoding: str | None) -> bytes:
     if not content_encoding:
         return raw_body
@@ -168,6 +223,69 @@ async def _parse_responses_request(request: Request) -> ResponsesRequest:
         raise RequestValidationError(exc.errors()) from exc
 
 
+def _set_state_from_payload(state: Any, parsed: object) -> None:
+    state.parsed_json_body = parsed
+    state.downstream_model = parsed.get("model") if isinstance(parsed, dict) else None
+    state.stream = parsed.get("stream") if isinstance(parsed, dict) else None
+    state.tool_summary = _summarize_tools(parsed)
+
+
+def _parse_websocket_responses_request(payload: object) -> ResponsesRequest:
+    if not isinstance(payload, dict):
+        raise ProxyError(400, "request_validation_error", "Request body did not match the expected Responses API schema.")
+
+    if payload.get("type") != "response.create":
+        raise ProxyError(
+            400,
+            "unsupported_websocket_message",
+            "Unsupported websocket message type. Expected 'response.create'.",
+        )
+
+    request_payload = {key: value for key, value in payload.items() if key != "type"}
+    try:
+        return ResponsesRequest.model_validate(request_payload)
+    except ValidationError as exc:
+        raise ProxyError(400, "request_validation_error", "Request body did not match the expected Responses API schema.") from exc
+
+
+async def _execute_responses_request(
+    responses_request: ResponsesRequest,
+    state: Any,
+    settings: Settings,
+    ollama_client: OllamaClient,
+):
+    upstream_request = translate_responses_request_to_chat(responses_request, settings)
+    state.upstream_summary = {
+        "tool_count": len(upstream_request.tools or []),
+        "tool_names": [tool.function.name for tool in (upstream_request.tools or [])],
+        "tool_choice": upstream_request.tool_choice,
+    }
+    started = perf_counter()
+    chat_response = await ollama_client.create_chat_completion(upstream_request)
+    choice = chat_response.choices[0] if chat_response.choices else None
+    if choice is not None:
+        state.upstream_summary = {
+            **state.upstream_summary,
+            "finish_reason": choice.finish_reason,
+            "response_has_tool_calls": bool(choice.message.tool_calls),
+            "response_tool_call_names": [tool_call.function.name for tool_call in (choice.message.tool_calls or [])],
+            "response_content_present": bool(choice.message.content),
+        }
+    translated = translate_chat_response_to_responses(responses_request, chat_response)
+    elapsed_ms = round((perf_counter() - started) * 1000, 2)
+
+    logger.info(
+        "completed request",
+        extra={
+            "downstream_model": responses_request.model or settings.default_model,
+            "upstream_model": chat_response.model,
+            "stream": responses_request.stream,
+            "latency_ms": elapsed_ms,
+        },
+    )
+    return translated
+
+
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
     settings = get_settings()
@@ -183,6 +301,7 @@ async def request_logging_middleware(request: Request, call_next):
     request.state.error_code = None
     request.state.tool_summary = None
     request.state.upstream_summary = None
+    request.state.request_kind = "responses_http" if request.method == "POST" and request.url.path == "/v1/responses" else None
 
     if request.url.path == "/v1/responses":
         raw_body = await request.body()
@@ -191,11 +310,7 @@ async def request_logging_middleware(request: Request, call_next):
                 parsed = json.loads(raw_body)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 parsed = None
-            request.state.parsed_json_body = parsed
-            if isinstance(parsed, dict):
-                request.state.downstream_model = parsed.get("model")
-                request.state.stream = parsed.get("stream")
-            request.state.tool_summary = _summarize_tools(parsed)
+            _set_state_from_payload(request.state, parsed)
 
     started = perf_counter()
     response = await call_next(request)
@@ -262,6 +377,77 @@ async def responses_get_probe() -> JSONResponse:
     )
 
 
+@app.websocket("/v1/responses")
+async def responses_websocket(
+    websocket: WebSocket,
+    settings: Settings = Depends(get_settings),
+):
+    websocket.state.request_id = uuid4().hex
+    websocket.state.bridge_run_id = None
+    active = load_active_run(settings.resolved_log_dir)
+    if active:
+        websocket.state.bridge_run_id = active.get("run_id")
+    websocket.state.parsed_json_body = None
+    websocket.state.downstream_model = None
+    websocket.state.stream = None
+    websocket.state.error_code = None
+    websocket.state.tool_summary = None
+    websocket.state.upstream_summary = None
+    websocket.state.request_kind = "responses_websocket"
+    websocket.state.status_code = 101
+    websocket.state.websocket_status = "accepted"
+    websocket.state.websocket_headers = _redact_websocket_headers(list(websocket.headers.items()))
+
+    started = perf_counter()
+    await websocket.accept()
+
+    try:
+        message = await websocket.receive()
+        if message.get("type") != "websocket.receive":
+            raise ProxyError(400, "websocket_protocol_error", "Expected a websocket message.")
+        text = message.get("text")
+        if text is None:
+            raise ProxyError(400, "websocket_protocol_error", "Expected the initial websocket message to be text JSON.")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ProxyError(400, "request_parse_error", "There was an error parsing the body") from exc
+
+        _set_state_from_payload(websocket.state, parsed)
+        responses_request = _parse_websocket_responses_request(parsed)
+        translated = await _execute_responses_request(
+            responses_request,
+            websocket.state,
+            settings,
+            websocket.app.state.ollama_client,
+        )
+
+        for event in build_response_events(translated):
+            await websocket.send_text(json.dumps(event, separators=(",", ":")))
+
+        websocket.state.status_code = 200
+        websocket.state.websocket_status = "completed"
+        await websocket.close()
+    except WebSocketDisconnect:
+        websocket.state.status_code = 499
+        websocket.state.error_code = "websocket_client_disconnected"
+        websocket.state.websocket_status = "client_disconnected"
+    except ProxyError as exc:
+        websocket.state.status_code = exc.status_code
+        websocket.state.error_code = exc.code
+        websocket.state.websocket_status = "proxy_error"
+        await websocket.send_text(
+            json.dumps(
+                {"type": "error", "error": {"message": exc.message, "type": "proxy_error", "code": exc.code}},
+                separators=(",", ":"),
+            )
+        )
+        await websocket.close(code=1008)
+    finally:
+        websocket.state.latency_ms = round((perf_counter() - started) * 1000, 2)
+        append_jsonl(request_log_path(settings.resolved_log_dir), _websocket_log_payload(websocket, settings))
+
+
 @app.post("/v1/responses", response_model=None)
 async def create_response(
     request: Request,
@@ -269,35 +455,7 @@ async def create_response(
     ollama_client: OllamaClient = Depends(get_ollama_client),
 ):
     responses_request = await _parse_responses_request(request)
-    upstream_request = translate_responses_request_to_chat(responses_request, settings)
-    request.state.upstream_summary = {
-        "tool_count": len(upstream_request.tools or []),
-        "tool_names": [tool.function.name for tool in (upstream_request.tools or [])],
-        "tool_choice": upstream_request.tool_choice,
-    }
-    started = perf_counter()
-    chat_response = await ollama_client.create_chat_completion(upstream_request)
-    choice = chat_response.choices[0] if chat_response.choices else None
-    if choice is not None:
-        request.state.upstream_summary = {
-            **request.state.upstream_summary,
-            "finish_reason": choice.finish_reason,
-            "response_has_tool_calls": bool(choice.message.tool_calls),
-            "response_tool_call_names": [tool_call.function.name for tool_call in (choice.message.tool_calls or [])],
-            "response_content_present": bool(choice.message.content),
-        }
-    translated = translate_chat_response_to_responses(responses_request, chat_response)
-    elapsed_ms = round((perf_counter() - started) * 1000, 2)
-
-    logger.info(
-        "completed request",
-        extra={
-            "downstream_model": responses_request.model or settings.default_model,
-            "upstream_model": chat_response.model,
-            "stream": responses_request.stream,
-            "latency_ms": elapsed_ms,
-        },
-    )
+    translated = await _execute_responses_request(responses_request, request.state, settings, ollama_client)
 
     if responses_request.stream:
         async def event_stream() -> AsyncIterator[str]:

@@ -18,6 +18,9 @@ class FakeOllamaClient:
         self.payload = payload
         self.last_request: ChatCompletionsRequest | None = None
 
+    async def close(self) -> None:
+        return None
+
     async def create_chat_completion(self, request: ChatCompletionsRequest) -> ChatCompletionsResponse:
         self.last_request = request
         return ChatCompletionsResponse.model_validate(self.payload)
@@ -39,8 +42,11 @@ def client() -> TestClient:
     )
     app.dependency_overrides[get_ollama_client] = lambda: fake
     with TestClient(app) as test_client:
+        original_ollama = test_client.app.state.ollama_client
+        test_client.app.state.ollama_client = fake
         test_client.fake_ollama = fake  # type: ignore[attr-defined]
         yield test_client
+        test_client.app.state.ollama_client = original_ollama
     app.dependency_overrides.clear()
 
 
@@ -155,6 +161,46 @@ def test_get_probe_returns_structured_transport_error(client: TestClient) -> Non
     response = client.get("/v1/responses")
     assert response.status_code == 405
     assert response.json()["error"]["code"] == "websocket_not_supported"
+
+
+def test_websocket_response_create_streams_events(client: TestClient) -> None:
+    with client.websocket_connect("/v1/responses") as websocket:
+        websocket.send_json({"type": "response.create", "input": "ping", "stream": True})
+        created = json.loads(websocket.receive_text())
+        in_progress = json.loads(websocket.receive_text())
+        completed = json.loads(websocket.receive_text())
+
+    assert created["type"] == "response.created"
+    assert in_progress["type"] == "response.in_progress"
+    assert completed["type"] == "response.completed"
+    assert completed["response"]["output"][0]["content"][0]["text"] == "pong"
+
+
+def test_websocket_invalid_first_message_returns_error(client: TestClient) -> None:
+    with client.websocket_connect("/v1/responses") as websocket:
+        websocket.send_text("not-json")
+        payload = json.loads(websocket.receive_text())
+
+    assert payload["type"] == "error"
+    assert payload["error"]["code"] == "request_parse_error"
+
+
+def test_websocket_invalid_message_type_returns_error(client: TestClient) -> None:
+    with client.websocket_connect("/v1/responses") as websocket:
+        websocket.send_json({"type": "response.cancel"})
+        payload = json.loads(websocket.receive_text())
+
+    assert payload["type"] == "error"
+    assert payload["error"]["code"] == "unsupported_websocket_message"
+
+
+def test_websocket_validation_error_returns_error(client: TestClient) -> None:
+    with client.websocket_connect("/v1/responses") as websocket:
+        websocket.send_json({"type": "response.create", "input": {"unexpected": "shape"}})
+        payload = json.loads(websocket.receive_text())
+
+    assert payload["type"] == "error"
+    assert payload["error"]["code"] == "request_validation_error"
 
 
 def test_request_validation_error_is_structured(client: TestClient) -> None:
@@ -383,3 +429,22 @@ def test_non_utf8_request_body_does_not_crash(client: TestClient) -> None:
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "request_parse_error"
+
+
+def test_websocket_request_is_logged(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    with client.websocket_connect("/v1/responses") as websocket:
+        websocket.send_json({"type": "response.create", "input": "ping", "stream": True})
+        websocket.receive_text()
+        websocket.receive_text()
+        websocket.receive_text()
+
+    log_path = request_log_path(tmp_path)
+    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    entry = entries[-1]
+    assert entry["request_kind"] == "responses_websocket"
+    assert entry["websocket_status"] == "completed"
+    assert entry["failure_class"] is None
+    assert entry["websocket_headers"]["sec-websocket-key"] == "[redacted]"

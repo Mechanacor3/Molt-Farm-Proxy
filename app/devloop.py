@@ -82,7 +82,14 @@ def build_model_aliases_json(explicit_json: str | None = None, upstream_model: s
     return json.dumps(aliases, ensure_ascii=True, separators=(",", ":"))
 
 
-def classify_proxy_failure(status_code: int | None, error_code: str | None, method: str) -> str | None:
+def classify_proxy_failure(
+    status_code: int | None,
+    error_code: str | None,
+    method: str,
+    request_kind: str | None = None,
+) -> str | None:
+    if request_kind == "responses_websocket":
+        return None if error_code is None else "transport_failure"
     if method == "GET":
         return "transport_failure"
     if error_code == "unsupported_tool":

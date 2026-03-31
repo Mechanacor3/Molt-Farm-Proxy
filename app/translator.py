@@ -243,17 +243,19 @@ def translate_chat_response_to_responses(
     )
 
 
-def build_sse_events(response: ResponsesResponse) -> list[str]:
+def build_response_events(response: ResponsesResponse) -> list[dict[str, Any]]:
     payload = response.model_dump(mode="json")
     created_payload = dict(payload)
     created_payload["status"] = "in_progress"
-    events = [
-        _format_sse({"type": "response.created", "sequence_number": 0, "response": created_payload}),
-        _format_sse({"type": "response.in_progress", "sequence_number": 1, "response": created_payload}),
-        _format_sse({"type": "response.completed", "sequence_number": 2, "response": payload}),
-        "data: [DONE]\n\n",
+    return [
+        {"type": "response.created", "sequence_number": 0, "response": created_payload},
+        {"type": "response.in_progress", "sequence_number": 1, "response": created_payload},
+        {"type": "response.completed", "sequence_number": 2, "response": payload},
     ]
-    return events
+
+
+def build_sse_events(response: ResponsesResponse) -> list[str]:
+    return [_format_sse(event) for event in build_response_events(response)] + ["data: [DONE]\n\n"]
 
 
 def _format_sse(payload: dict[str, Any]) -> str:
