@@ -59,12 +59,42 @@ uv run codex-bridge-report --limit 5
 `molt-proxy-dev` starts the FastAPI proxy with bridge-friendly model aliases so
 default Codex model names such as `gpt-5.4` route to the local Ollama model.
 
+## Continuation Tests
+
+For a reliable multi-turn continuation test, capture the session id from the
+first run's `thread.started` event and resume that exact session:
+
+```bash
+uv run codex-bridge exec --json "hi"
+uv run codex-bridge exec resume <session-id> --json "thanks"
+```
+
+Prefer an explicit session id over `resume --last`. On a machine with other
+Codex activity, `--last` can resume a different recent session and make the
+result look flaky.
+
 ## Useful Commands
 
 Run the tests:
 
 ```bash
 uv run pytest
+```
+
+Probe function-calling without the full Codex client:
+
+```bash
+uv run python examples/get_weather_tool_probe.py
+```
+
+That script sends a single `get_weather` function tool to `POST /v1/responses`,
+prints the first response, and if the model emits a function call it posts a
+fake tool result back on a second turn.
+
+To hit Ollama directly instead of the proxy:
+
+```bash
+uv run python examples/get_weather_tool_probe.py --mode chat --model nemotron-3-nano:4b
 ```
 
 See the agent/operator guide:

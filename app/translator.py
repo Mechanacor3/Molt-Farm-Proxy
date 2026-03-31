@@ -81,6 +81,14 @@ def _translate_tools(tools: list[ResponseTool] | None) -> list[ChatTool] | None:
     return translated
 
 
+def _filter_translated_tools(tools: list[ChatTool] | None, settings: Settings) -> list[ChatTool] | None:
+    allowed = settings.debug_tool_name_set
+    if not tools or not allowed:
+        return tools
+    filtered = [tool for tool in tools if tool.function.name in allowed]
+    return filtered or None
+
+
 def translate_responses_request_to_chat(request: ResponsesRequest, settings: Settings) -> ChatCompletionsRequest:
     messages: list[ChatMessage] = []
     hidden_reasoning: list[str] = []
@@ -156,7 +164,7 @@ def translate_responses_request_to_chat(request: ResponsesRequest, settings: Set
         model=model,
         messages=messages,
         stream=False,
-        tools=_translate_tools(request.tools),
+        tools=_filter_translated_tools(_translate_tools(request.tools), settings),
         tool_choice=request.tool_choice,
         temperature=request.temperature,
         top_p=request.top_p,

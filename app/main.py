@@ -60,6 +60,12 @@ def _request_log_payload(request: Request, response_status: int, settings: Setti
         "error_code": error_code,
         "failure_class": classify_proxy_failure(response_status, error_code, request.method),
     }
+    tool_summary = getattr(request.state, "tool_summary", None)
+    if tool_summary is not None:
+        payload["tool_summary"] = tool_summary
+    upstream_summary = getattr(request.state, "upstream_summary", None)
+    if upstream_summary is not None:
+        payload["upstream_summary"] = upstream_summary
     if settings.debug_payload_logging and request_body is not None:
         payload["request_body"] = request_body
     return payload
@@ -75,6 +81,42 @@ def _sanitize_for_json(value):
     if isinstance(value, tuple):
         return [_sanitize_for_json(item) for item in value]
     return value
+
+
+def _summarize_tools(parsed: object) -> list[dict[str, object]] | None:
+    if not isinstance(parsed, dict):
+        return None
+
+    raw_tools = parsed.get("tools")
+    if not isinstance(raw_tools, list):
+        return None
+
+    summary: list[dict[str, object]] = []
+    for tool in raw_tools:
+        if not isinstance(tool, dict):
+            summary.append({"raw_type": type(tool).__name__})
+            continue
+
+        function = tool.get("function")
+        function_name = function.get("name") if isinstance(function, dict) else None
+        parameters = function.get("parameters") if isinstance(function, dict) else tool.get("parameters")
+        required = parameters.get("required") if isinstance(parameters, dict) else None
+        properties = parameters.get("properties") if isinstance(parameters, dict) else None
+        property_names = sorted(properties.keys()) if isinstance(properties, dict) else None
+
+        summary.append(
+            {
+                "type": tool.get("type"),
+                "name": tool.get("name"),
+                "function_name": function_name,
+                "external_web_access": tool.get("external_web_access"),
+                "has_function": isinstance(function, dict),
+                "parameter_type": parameters.get("type") if isinstance(parameters, dict) else None,
+                "property_names": property_names,
+                "required": required if isinstance(required, list) else None,
+            }
+        )
+    return summary
 
 
 def _decode_request_body(raw_body: bytes, content_encoding: str | None) -> bytes:
@@ -118,6 +160,7 @@ async def _parse_responses_request(request: Request) -> ResponsesRequest:
     if isinstance(parsed, dict):
         request.state.downstream_model = parsed.get("model")
         request.state.stream = parsed.get("stream")
+    request.state.tool_summary = _summarize_tools(parsed)
 
     try:
         return ResponsesRequest.model_validate(parsed)
@@ -138,6 +181,8 @@ async def request_logging_middleware(request: Request, call_next):
     request.state.downstream_model = None
     request.state.stream = None
     request.state.error_code = None
+    request.state.tool_summary = None
+    request.state.upstream_summary = None
 
     if request.url.path == "/v1/responses":
         raw_body = await request.body()
@@ -150,6 +195,7 @@ async def request_logging_middleware(request: Request, call_next):
             if isinstance(parsed, dict):
                 request.state.downstream_model = parsed.get("model")
                 request.state.stream = parsed.get("stream")
+            request.state.tool_summary = _summarize_tools(parsed)
 
     started = perf_counter()
     response = await call_next(request)
@@ -224,8 +270,22 @@ async def create_response(
 ):
     responses_request = await _parse_responses_request(request)
     upstream_request = translate_responses_request_to_chat(responses_request, settings)
+    request.state.upstream_summary = {
+        "tool_count": len(upstream_request.tools or []),
+        "tool_names": [tool.function.name for tool in (upstream_request.tools or [])],
+        "tool_choice": upstream_request.tool_choice,
+    }
     started = perf_counter()
     chat_response = await ollama_client.create_chat_completion(upstream_request)
+    choice = chat_response.choices[0] if chat_response.choices else None
+    if choice is not None:
+        request.state.upstream_summary = {
+            **request.state.upstream_summary,
+            "finish_reason": choice.finish_reason,
+            "response_has_tool_calls": bool(choice.message.tool_calls),
+            "response_tool_call_names": [tool_call.function.name for tool_call in (choice.message.tool_calls or [])],
+            "response_content_present": bool(choice.message.content),
+        }
     translated = translate_chat_response_to_responses(responses_request, chat_response)
     elapsed_ms = round((perf_counter() - started) * 1000, 2)
 

@@ -36,6 +36,12 @@ Run the real Codex binary through the bridge:
 codex-bridge exec --json "Reply with the single word pong."
 ```
 
+Continue a specific prior Codex session by session id:
+
+```bash
+codex-bridge exec resume <session-id> --json "thanks"
+```
+
 Use the VS Code-flavored alias if you want the intent to be explicit:
 
 ```bash
@@ -136,6 +142,10 @@ Codex request we can already observe.
 - If you need the exact fallback body, capture it from a raw listener instead of
   guessing. A simple local socket listener on another port is enough to confirm
   headers, compression, and SSE expectations.
+- When testing multi-turn behavior, prefer `codex-bridge exec resume
+  <session-id> ...` over `resume --last`. `--last` can pick an unrelated recent
+  Codex session from the same machine, while the explicit session id locks the
+  follow-up turn to the exact run you just observed.
 - If the proxy reports `request_parse_error` before route logic runs, check
   `Content-Encoding` first. The real client currently sends zstd-compressed
   request bodies on HTTP fallback.

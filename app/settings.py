@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     model_aliases_json: str = Field(default="{}")
     request_timeout_seconds: float = 120.0
     debug_payload_logging: bool = False
+    debug_tool_names: str | None = None
     log_dir: str = ".molt-logs"
 
     @field_validator("ollama_base_url")
@@ -48,6 +49,13 @@ class Settings(BaseSettings):
         if not requested_model:
             return self.default_model
         return self.model_aliases.get(requested_model, requested_model)
+
+    @property
+    def debug_tool_name_set(self) -> set[str] | None:
+        if not self.debug_tool_names:
+            return None
+        names = {item.strip() for item in self.debug_tool_names.split(",") if item.strip()}
+        return names or None
 
 
 @lru_cache(maxsize=1)

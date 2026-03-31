@@ -31,6 +31,19 @@ def test_build_codex_command_respects_existing_model() -> None:
     assert "custom-model" in command
 
 
+def test_build_codex_command_preserves_explicit_resume_session_id() -> None:
+    command = build_codex_command(
+        "/tmp/codex",
+        "http://127.0.0.1:8000/v1",
+        "codex-bridge",
+        ["exec", "resume", "019d4521-cf09-7b61-add0-069a443ca23e", "--json", "thanks"],
+    )
+    assert "resume" in command
+    assert "019d4521-cf09-7b61-add0-069a443ca23e" in command
+    assert "--json" in command
+    assert "thanks" in command
+
+
 def test_failure_classification_covers_expected_paths() -> None:
     assert classify_proxy_failure(405, "websocket_not_supported", "GET") == "transport_failure"
     assert classify_proxy_failure(400, "request_validation_error", "POST") == "schema_mismatch"

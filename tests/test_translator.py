@@ -47,6 +47,83 @@ def test_reasoning_and_tool_result_translate_to_chat() -> None:
     assert translated.tools is not None
 
 
+def test_tool_list_translates_for_ollama_and_ignores_disabled_web_search() -> None:
+    request = ResponsesRequest(
+        input="tool?",
+        tool_choice="auto",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                },
+            },
+            {
+                "type": "web_search",
+                "external_web_access": False,
+            },
+        ],
+    )
+
+    translated = translate_responses_request_to_chat(request, Settings())
+
+    assert translated.tool_choice == "auto"
+    assert translated.tools is not None
+    assert [tool.function.name for tool in translated.tools] == ["read_file", "exec_command"]
+    assert translated.tools[0].function.parameters["required"] == ["path"]
+    assert translated.tools[1].function.parameters["required"] == ["cmd"]
+
+
+def test_debug_tool_name_filter_keeps_only_named_tool() -> None:
+    request = ResponsesRequest(
+        input="tool?",
+        tools=[
+            {
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "write_stdin",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"session_id": {"type": "integer"}},
+                    "required": ["session_id"],
+                },
+            },
+        ],
+    )
+
+    translated = translate_responses_request_to_chat(
+        request,
+        Settings(debug_tool_names="exec_command"),
+    )
+
+    assert translated.tools is not None
+    assert [tool.function.name for tool in translated.tools] == ["exec_command"]
+
+
 def test_chat_text_response_translates_to_responses() -> None:
     request = ResponsesRequest(input="hi")
     chat_response = ChatCompletionsResponse.model_validate(
