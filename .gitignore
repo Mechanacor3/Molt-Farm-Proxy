@@ -1,0 +1,8 @@
+.pytest_cache/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.molt-logs/
