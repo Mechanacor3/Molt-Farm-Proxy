@@ -82,10 +82,18 @@ Known current behavior with real Codex:
 
 - Codex first probes `GET /v1/responses` expecting websocket-style behavior
 - Codex then falls back to HTTP
-- The HTTP fallback body is not yet fully compatible with the proxy’s expected
-  Responses schema, so the loop currently records a schema mismatch
+- The HTTP fallback body is `content-encoding: zstd`, usually requests
+  `accept: text/event-stream`, and uses `stream: true`
+- The fallback `input` shape includes `message` items with a leading
+  `developer` role that should be translated to upstream chat `system`
+- The real tool list can include a disabled
+  `{"type":"web_search","external_web_access":false}` entry alongside
+  function tools
+- The client expects typed Responses SSE frames in `data:` payloads, including
+  `response.created`, `response.in_progress`, and `response.completed`
 
-This is expected. The bridge exists to make those failures concrete.
+Websocket transport is still intentionally unsupported. The bridge exists to
+make those failures concrete and move the HTTP fallback forward.
 
 ## Tight Improvement Loop
 
@@ -122,6 +130,18 @@ A strong feature-improvement pass should:
 
 Do not optimize for hypothetical compatibility first. Optimize for the next real
 Codex request we can already observe.
+
+## Tips From Real Runs
+
+- If you need the exact fallback body, capture it from a raw listener instead of
+  guessing. A simple local socket listener on another port is enough to confirm
+  headers, compression, and SSE expectations.
+- If the proxy reports `request_parse_error` before route logic runs, check
+  `Content-Encoding` first. The real client currently sends zstd-compressed
+  request bodies on HTTP fallback.
+- If the bridge progresses to `stream disconnected before completion`, inspect
+  SSE framing next. A `200` alone is not enough; the client is sensitive to the
+  concrete Responses event shape.
 
 ## Files To Start With
 

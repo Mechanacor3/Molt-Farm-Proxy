@@ -6,3 +6,6 @@ __pycache__/
 *.pyd
 *.egg-info/
 .molt-logs/
+.molt-logs-debug/
+.codex
+uv.lock

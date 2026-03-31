@@ -95,6 +95,8 @@ def translate_responses_request_to_chat(request: ResponsesRequest, settings: Set
             item = _item_to_model(raw_item)
             if item.type == "message":
                 role = item.role or "user"
+                if role == "developer":
+                    role = "system"
                 messages.append(ChatMessage(role=role, content=_extract_text(item.content)))
             elif item.type == "reasoning":
                 if item.summary:
@@ -235,14 +237,16 @@ def translate_chat_response_to_responses(
 
 def build_sse_events(response: ResponsesResponse) -> list[str]:
     payload = response.model_dump(mode="json")
+    created_payload = dict(payload)
+    created_payload["status"] = "in_progress"
     events = [
-        _format_sse("response.created", payload),
-        _format_sse("response.in_progress", payload),
-        _format_sse("response.completed", payload),
+        _format_sse({"type": "response.created", "sequence_number": 0, "response": created_payload}),
+        _format_sse({"type": "response.in_progress", "sequence_number": 1, "response": created_payload}),
+        _format_sse({"type": "response.completed", "sequence_number": 2, "response": payload}),
         "data: [DONE]\n\n",
     ]
     return events
 
 
-def _format_sse(event_name: str, payload: dict[str, Any]) -> str:
-    return f"event: {event_name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+def _format_sse(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"

@@ -27,6 +27,18 @@ def validate_response_tools(tools: list[ResponseTool] | None) -> dict[str, Respo
         return registry
 
     for tool in tools:
+        if tool.type == "web_search":
+            extra = tool.model_extra or {}
+            if extra.get("external_web_access") is False:
+                continue
+            raise ProxyError(
+                status_code=400,
+                code="unsupported_tool",
+                message=(
+                    "Unsupported Responses tool type 'web_search'. "
+                    "This proxy cannot forward web search tools with external access."
+                ),
+            )
         if tool.type != "function":
             raise ProxyError(
                 status_code=400,

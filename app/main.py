@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from io import BytesIO
 from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import AsyncIterator
@@ -10,7 +11,9 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+import zstandard as zstd
 
 from app.errors import ProxyError
 from app.devloop import classify_proxy_failure, load_active_run, request_log_path
@@ -72,6 +75,54 @@ def _sanitize_for_json(value):
     if isinstance(value, tuple):
         return [_sanitize_for_json(item) for item in value]
     return value
+
+
+def _decode_request_body(raw_body: bytes, content_encoding: str | None) -> bytes:
+    if not content_encoding:
+        return raw_body
+
+    encodings = [token.strip().lower() for token in content_encoding.split(",") if token.strip()]
+    decoded = raw_body
+    for encoding in encodings:
+        if encoding == "identity":
+            continue
+        if encoding == "zstd":
+            try:
+                with zstd.ZstdDecompressor().stream_reader(BytesIO(decoded)) as reader:
+                    decoded = reader.read()
+            except zstd.ZstdError as exc:
+                raise ProxyError(
+                    400,
+                    "request_parse_error",
+                    "There was an error parsing the body",
+                ) from exc
+            continue
+        raise ProxyError(
+            400,
+            "request_parse_error",
+            f"Unsupported Content-Encoding '{encoding}'.",
+        )
+    return decoded
+
+
+async def _parse_responses_request(request: Request) -> ResponsesRequest:
+    raw_body = await request.body()
+    decoded_body = _decode_request_body(raw_body, request.headers.get("content-encoding"))
+
+    try:
+        parsed = json.loads(decoded_body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProxyError(400, "request_parse_error", "There was an error parsing the body") from exc
+
+    request.state.parsed_json_body = parsed
+    if isinstance(parsed, dict):
+        request.state.downstream_model = parsed.get("model")
+        request.state.stream = parsed.get("stream")
+
+    try:
+        return ResponsesRequest.model_validate(parsed)
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors()) from exc
 
 
 @app.middleware("http")
@@ -167,27 +218,28 @@ async def responses_get_probe() -> JSONResponse:
 
 @app.post("/v1/responses", response_model=None)
 async def create_response(
-    request: ResponsesRequest,
+    request: Request,
     settings: Settings = Depends(get_settings),
     ollama_client: OllamaClient = Depends(get_ollama_client),
 ):
-    upstream_request = translate_responses_request_to_chat(request, settings)
+    responses_request = await _parse_responses_request(request)
+    upstream_request = translate_responses_request_to_chat(responses_request, settings)
     started = perf_counter()
     chat_response = await ollama_client.create_chat_completion(upstream_request)
-    translated = translate_chat_response_to_responses(request, chat_response)
+    translated = translate_chat_response_to_responses(responses_request, chat_response)
     elapsed_ms = round((perf_counter() - started) * 1000, 2)
 
     logger.info(
         "completed request",
         extra={
-            "downstream_model": request.model or settings.default_model,
+            "downstream_model": responses_request.model or settings.default_model,
             "upstream_model": chat_response.model,
-            "stream": request.stream,
+            "stream": responses_request.stream,
             "latency_ms": elapsed_ms,
         },
     )
 
-    if request.stream:
+    if responses_request.stream:
         async def event_stream() -> AsyncIterator[str]:
             for event in build_sse_events(translated):
                 yield event

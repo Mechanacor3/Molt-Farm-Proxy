@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.errors import ProxyError
 from app.schemas_chat import ChatToolCall, ChatToolFunctionCall
 from app.schemas_responses import ResponseTool, ResponseToolFunction
-from app.tool_guard import validate_and_rewrite_tool_calls
+from app.tool_guard import validate_and_rewrite_tool_calls, validate_response_tools
 
 
 def _tool() -> ResponseTool:
@@ -77,5 +77,30 @@ def test_missing_required_argument_fails() -> None:
         validate_and_rewrite_tool_calls(calls, [_tool()])
     except ProxyError as exc:
         assert exc.code == "invalid_tool_call"
+    else:  # pragma: no cover
+        raise AssertionError("expected ProxyError")
+
+
+def test_disabled_web_search_tool_is_ignored() -> None:
+    registry = validate_response_tools(
+        [
+            ResponseTool(type="web_search", external_web_access=False),
+            ResponseTool(
+                type="function",
+                function=ResponseToolFunction(
+                    name="exec_command",
+                    parameters={"type": "object", "properties": {"cmd": {"type": "string"}}},
+                ),
+            ),
+        ]
+    )
+    assert list(registry) == ["exec_command"]
+
+
+def test_external_web_search_tool_is_rejected() -> None:
+    try:
+        validate_response_tools([ResponseTool(type="web_search", external_web_access=True)])
+    except ProxyError as exc:
+        assert exc.code == "unsupported_tool"
     else:  # pragma: no cover
         raise AssertionError("expected ProxyError")
