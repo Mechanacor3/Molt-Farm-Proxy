@@ -97,6 +97,22 @@ To hit Ollama directly instead of the proxy:
 uv run python examples/get_weather_tool_probe.py --mode chat --model nemotron-3-nano:4b
 ```
 
+Probe how far a narrower `exec_command` definition makes it through against
+direct Ollama chat and proxy Responses:
+
+```bash
+uv run python examples/exec_command_capability_probe.py --model nemotron-3-nano:4b
+```
+
+`--surface chat` talks straight to Ollama. `--surface responses` and
+`--surface both` expect the proxy to be running on `http://127.0.0.1:8000`.
+
+For machine-readable pass/fail flags:
+
+```bash
+uv run python examples/exec_command_capability_probe.py --model nemotron-3-nano:4b --json
+```
+
 See the agent/operator guide:
 
 ```bash
