@@ -94,6 +94,8 @@ def classify_proxy_failure(
         return "transport_failure"
     if error_code == "unsupported_tool":
         return "unsupported_tool"
+    if error_code in {"no_forwardable_tools", "hosted_tool_observed", "tool_definition_policy_error"}:
+        return "unsupported_tool"
     if error_code in {"invalid_input", "unsupported_input_item", "request_validation_error", "request_parse_error"}:
         return "schema_mismatch"
     if error_code and error_code.startswith("upstream_"):

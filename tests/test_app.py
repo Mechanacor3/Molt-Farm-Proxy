@@ -80,6 +80,7 @@ def test_streaming_response_returns_final_sse(client: TestClient) -> None:
         text = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in response.iter_text())
     assert response.status_code == 200
     assert '"type":"response.created"' in text
+    assert '"type":"response.output_item.added"' in text
     assert '"type":"response.completed"' in text
     assert "data: [DONE]" in text
 
@@ -154,7 +155,55 @@ def test_unsupported_tool_rejected(client: TestClient) -> None:
         json={"input": "ping", "tools": [{"type": "web_search_preview"}]},
     )
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "unsupported_tool"
+    assert response.json()["error"]["code"] == "no_forwardable_tools"
+
+
+def test_hosted_tool_is_observed_but_ignored_when_function_tool_exists(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": "ping",
+            "tools": [
+                {"type": "http", "name": "fetch_docs"},
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    log_path = request_log_path(tmp_path)
+    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert entries[-1]["tool_diagnostics"]["counts"]["hosted_tool_observed_not_executed"] == 1
+    assert entries[-1]["tool_diagnostics"]["counts"]["function_forwarded"] == 1
+
+
+def test_only_hosted_tool_returns_specific_policy_error(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    response = client.post(
+        "/v1/responses",
+        json={"input": "ping", "tools": [{"type": "http", "name": "fetch_docs"}]},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "no_forwardable_tools"
+    assert response.json()["error"]["details"]["failure_detail"] == "tool_definition_policy_error"
+
+    log_path = request_log_path(tmp_path)
+    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert entries[-1]["failure_detail"] == "tool_definition_policy_error"
 
 
 def test_get_probe_returns_structured_transport_error(client: TestClient) -> None:
@@ -168,10 +217,12 @@ def test_websocket_response_create_streams_events(client: TestClient) -> None:
         websocket.send_json({"type": "response.create", "input": "ping", "stream": True})
         created = json.loads(websocket.receive_text())
         in_progress = json.loads(websocket.receive_text())
+        output_added = json.loads(websocket.receive_text())
         completed = json.loads(websocket.receive_text())
 
     assert created["type"] == "response.created"
     assert in_progress["type"] == "response.in_progress"
+    assert output_added["type"] == "response.output_item.added"
     assert completed["type"] == "response.completed"
     assert completed["response"]["output"][0]["content"][0]["text"] == "pong"
 
@@ -310,6 +361,8 @@ def test_zstd_request_logs_decoded_tool_summary(client: TestClient, monkeypatch:
             "required": ["cmd"],
         },
     ]
+    assert entries[-1]["tool_diagnostics"]["counts"]["web_search_disabled_ignored"] == 1
+    assert entries[-1]["tool_diagnostics"]["counts"]["function_forwarded"] == 1
 
 
 def test_request_log_includes_upstream_tool_use_summary(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -377,7 +430,125 @@ def test_request_log_includes_upstream_tool_use_summary(client: TestClient, monk
         "response_has_tool_calls": True,
         "response_tool_call_names": ["read_file"],
         "response_content_present": False,
+        "tool_call_validation": {
+            "attempted": 1,
+            "validated": 1,
+            "rewritten": 0,
+            "coercions": 0,
+            "dropped_extra_fields": 0,
+            "rewritten_names": 0,
+            "calls": [
+                {
+                    "call_id": "call_1",
+                    "rewritten": False,
+                    "original_name": "read_file",
+                    "canonical_name": "read_file",
+                    "coercions": [],
+                    "dropped_extra_fields": [],
+                    "missing_required": [],
+                }
+            ],
+        },
     }
+
+
+def test_textual_tool_call_is_recovered_into_responses_function_call(client: TestClient) -> None:
+    fake = FakeOllamaClient(
+        {
+            "id": "chatcmpl-2",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "nemotron-3-nano:4b",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"command":"pwd","timeout":5}',
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    )
+    app.dependency_overrides[get_ollama_client] = lambda: fake
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": "run pwd",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cmd": {"type": "string"}},
+                            "required": ["cmd"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["output"][0]["type"] == "function_call"
+    assert body["output"][0]["name"] == "exec_command"
+    assert body["output"][0]["arguments"] == '{"cmd":"pwd"}'
+
+
+def test_fenced_tool_name_tool_input_is_recovered(client: TestClient) -> None:
+    fake = FakeOllamaClient(
+        {
+            "id": "chatcmpl-2",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "nemotron-3-nano:4b",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": '```json\n{"tool_name":"exec_command","tool_input":"pwd"}\n```',
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    )
+    app.dependency_overrides[get_ollama_client] = lambda: fake
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": "run pwd",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cmd": {"type": "string"}},
+                            "required": ["cmd"],
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["output"][0]["type"] == "function_call"
+    assert body["output"][0]["name"] == "exec_command"
+    assert body["output"][0]["arguments"] == '{"cmd":"pwd"}'
 
 
 def test_debug_tool_filter_reduces_forwarded_tool_names(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -429,6 +600,90 @@ def test_non_utf8_request_body_does_not_crash(client: TestClient) -> None:
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "request_parse_error"
+
+
+def test_request_features_log_recognized_ignored_fields(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": "ping",
+            "parallel_tool_calls": False,
+            "include": [],
+            "store": False,
+            "prompt_cache_key": "req-123",
+        },
+    )
+
+    assert response.status_code == 200
+
+    log_path = request_log_path(tmp_path)
+    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert entries[-1]["request_features"] == {
+        "recognized_ignored_fields": ["include", "parallel_tool_calls", "prompt_cache_key", "store"],
+        "count": 4,
+    }
+
+
+def test_invalid_upstream_tool_call_logs_failure_detail(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    fake = FakeOllamaClient(
+        {
+            "id": "chatcmpl-3",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "nemotron-3-nano:4b",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "read_file", "arguments": '{"extra":"no-path"}'},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+    )
+    app.dependency_overrides[get_ollama_client] = lambda: fake
+    monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "input": "read it",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["details"]["failure_detail"] == "upstream_selected_invalid_tool"
+
+    log_path = request_log_path(tmp_path)
+    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    assert entries[-1]["failure_detail"] == "upstream_selected_invalid_tool"
 
 
 def test_websocket_request_is_logged(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

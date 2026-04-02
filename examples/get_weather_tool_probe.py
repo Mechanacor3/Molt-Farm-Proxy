@@ -83,6 +83,29 @@ def first_chat_tool_call(payload: dict[str, Any]) -> dict[str, Any] | None:
     return tool_calls[0]
 
 
+def responses_tool_output_value(tool_output: Any) -> str:
+    if isinstance(tool_output, str):
+        return tool_output
+    return json.dumps(tool_output)
+
+
+def build_responses_followup_input(prompt: str, call: dict[str, Any], tool_output: Any) -> list[dict[str, Any]]:
+    return [
+        {"type": "message", "role": "user", "content": prompt},
+        {
+            "type": "function_call",
+            "call_id": call["call_id"],
+            "name": call["name"],
+            "arguments": call["arguments"],
+        },
+        {
+            "type": "function_call_output",
+            "call_id": call["call_id"],
+            "output": responses_tool_output_value(tool_output),
+        },
+    ]
+
+
 def run_responses_mode(client: httpx.Client, base_url: str, model: str, prompt: str, tool_output: dict[str, Any]) -> None:
     first = send_response_request(client, base_url, model, prompt)
     print("=== First response ===")
@@ -98,20 +121,7 @@ def run_responses_mode(client: httpx.Client, base_url: str, model: str, prompt: 
     print(f"call_id: {call['call_id']}")
     print(f"arguments: {call['arguments']}")
 
-    followup_input = [
-        {"type": "message", "role": "user", "content": prompt},
-        {
-            "type": "function_call",
-            "call_id": call["call_id"],
-            "name": call["name"],
-            "arguments": call["arguments"],
-        },
-        {
-            "type": "function_call_output",
-            "call_id": call["call_id"],
-            "output": tool_output,
-        },
-    ]
+    followup_input = build_responses_followup_input(prompt, call, tool_output)
     second = send_response_request(client, base_url, model, followup_input)
     print("\n=== Second response with fake tool output ===")
     print(json.dumps(second, indent=2))

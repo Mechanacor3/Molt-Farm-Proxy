@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
+_MODULE_PATH = Path(__file__).resolve().parents[1] / "examples" / "get_weather_tool_probe.py"
+_SPEC = importlib.util.spec_from_file_location("get_weather_tool_probe", _MODULE_PATH)
+assert _SPEC is not None
+assert _SPEC.loader is not None
+_MODULE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_MODULE)
+
+build_responses_followup_input = _MODULE.build_responses_followup_input
+responses_tool_output_value = _MODULE.responses_tool_output_value
+
+
+def test_responses_tool_output_value_stringifies_objects() -> None:
+    assert responses_tool_output_value({"temp_f": 61, "condition": "sunny"}) == '{"temp_f": 61, "condition": "sunny"}'
+    assert responses_tool_output_value([1, 2, 3]) == "[1, 2, 3]"
+
+
+def test_responses_tool_output_value_preserves_strings() -> None:
+    assert responses_tool_output_value('{"temp_f":61}') == '{"temp_f":61}'
+
+
+def test_build_responses_followup_input_uses_string_tool_output() -> None:
+    call = {
+        "call_id": "call_123",
+        "name": "get_weather",
+        "arguments": json.dumps({"city": "Boston", "unit": "f"}),
+    }
+
+    payload = build_responses_followup_input(
+        "What is the weather in Boston?",
+        call,
+        {"temp_f": 61, "condition": "sunny"},
+    )
+
+    assert payload[2] == {
+        "type": "function_call_output",
+        "call_id": "call_123",
+        "output": '{"temp_f": 61, "condition": "sunny"}',
+    }

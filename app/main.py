@@ -22,7 +22,9 @@ from app.jsonl import append_jsonl, utc_now_iso
 from app.ollama_client import OllamaClient
 from app.schemas_responses import ResponsesRequest
 from app.settings import Settings, get_settings
+from app.tool_guard import summarize_request_ignored_fields
 from app.translator import (
+    build_tool_compatibility,
     build_response_events,
     build_sse_events,
     translate_chat_response_to_responses,
@@ -73,9 +75,27 @@ def _request_log_payload(request: Request, response_status: int, settings: Setti
     tool_summary = getattr(request.state, "tool_summary", None)
     if tool_summary is not None:
         payload["tool_summary"] = tool_summary
+    tool_diagnostics = getattr(request.state, "tool_diagnostics", None)
+    if tool_diagnostics is not None:
+        payload["tool_diagnostics"] = tool_diagnostics
+        counts = tool_diagnostics.get("counts")
+        if isinstance(counts, dict):
+            payload["tool_count_observed"] = counts.get("observed")
+            payload["tool_count_forwarded"] = counts.get("forwarded")
+            payload["tool_count_ignored"] = counts.get("ignored")
+            payload["tool_count_rejected"] = counts.get("rejected")
+    failure_detail = getattr(request.state, "failure_detail", None)
+    if failure_detail is not None:
+        payload["failure_detail"] = failure_detail
+    tool_call_diagnostics = getattr(request.state, "tool_call_diagnostics", None)
+    if tool_call_diagnostics is not None:
+        payload["tool_call_diagnostics"] = tool_call_diagnostics
     upstream_summary = getattr(request.state, "upstream_summary", None)
     if upstream_summary is not None:
         payload["upstream_summary"] = upstream_summary
+    request_features = getattr(request.state, "request_features", None)
+    if request_features is not None:
+        payload["request_features"] = request_features
     if settings.debug_payload_logging and request_body is not None:
         payload["request_body"] = request_body
     return payload
@@ -107,9 +127,21 @@ def _websocket_log_payload(websocket: WebSocket, settings: Settings) -> dict[str
     tool_summary = getattr(websocket.state, "tool_summary", None)
     if tool_summary is not None:
         payload["tool_summary"] = tool_summary
+    tool_diagnostics = getattr(websocket.state, "tool_diagnostics", None)
+    if tool_diagnostics is not None:
+        payload["tool_diagnostics"] = tool_diagnostics
+    failure_detail = getattr(websocket.state, "failure_detail", None)
+    if failure_detail is not None:
+        payload["failure_detail"] = failure_detail
+    tool_call_diagnostics = getattr(websocket.state, "tool_call_diagnostics", None)
+    if tool_call_diagnostics is not None:
+        payload["tool_call_diagnostics"] = tool_call_diagnostics
     upstream_summary = getattr(websocket.state, "upstream_summary", None)
     if upstream_summary is not None:
         payload["upstream_summary"] = upstream_summary
+    request_features = getattr(websocket.state, "request_features", None)
+    if request_features is not None:
+        payload["request_features"] = request_features
     websocket_headers = getattr(websocket.state, "websocket_headers", None)
     if websocket_headers is not None:
         payload["websocket_headers"] = websocket_headers
@@ -216,6 +248,7 @@ async def _parse_responses_request(request: Request) -> ResponsesRequest:
         request.state.downstream_model = parsed.get("model")
         request.state.stream = parsed.get("stream")
     request.state.tool_summary = _summarize_tools(parsed)
+    request.state.request_features = summarize_request_ignored_fields(parsed)
 
     try:
         return ResponsesRequest.model_validate(parsed)
@@ -228,6 +261,7 @@ def _set_state_from_payload(state: Any, parsed: object) -> None:
     state.downstream_model = parsed.get("model") if isinstance(parsed, dict) else None
     state.stream = parsed.get("stream") if isinstance(parsed, dict) else None
     state.tool_summary = _summarize_tools(parsed)
+    state.request_features = summarize_request_ignored_fields(parsed)
 
 
 def _parse_websocket_responses_request(payload: object) -> ResponsesRequest:
@@ -254,7 +288,13 @@ async def _execute_responses_request(
     settings: Settings,
     ollama_client: OllamaClient,
 ):
-    upstream_request = translate_responses_request_to_chat(responses_request, settings)
+    compatibility = build_tool_compatibility(
+        responses_request.tools,
+        settings,
+        require_forwardable=bool(responses_request.tools),
+    )
+    state.tool_diagnostics = compatibility.as_log_payload() if responses_request.tools else None
+    upstream_request = translate_responses_request_to_chat(responses_request, settings, compatibility)
     state.upstream_summary = {
         "tool_count": len(upstream_request.tools or []),
         "tool_names": [tool.function.name for tool in (upstream_request.tools or [])],
@@ -271,7 +311,11 @@ async def _execute_responses_request(
             "response_tool_call_names": [tool_call.function.name for tool_call in (choice.message.tool_calls or [])],
             "response_content_present": bool(choice.message.content),
         }
-    translated = translate_chat_response_to_responses(responses_request, chat_response)
+    translated, tool_call_validation = translate_chat_response_to_responses(responses_request, chat_response)
+    state.upstream_summary = {
+        **state.upstream_summary,
+        "tool_call_validation": tool_call_validation.diagnostics,
+    }
     elapsed_ms = round((perf_counter() - started) * 1000, 2)
 
     logger.info(
@@ -299,8 +343,12 @@ async def request_logging_middleware(request: Request, call_next):
     request.state.downstream_model = None
     request.state.stream = None
     request.state.error_code = None
+    request.state.failure_detail = None
+    request.state.tool_call_diagnostics = None
     request.state.tool_summary = None
+    request.state.tool_diagnostics = None
     request.state.upstream_summary = None
+    request.state.request_features = None
     request.state.request_kind = "responses_http" if request.method == "POST" and request.url.path == "/v1/responses" else None
 
     if request.url.path == "/v1/responses":
@@ -324,15 +372,28 @@ async def request_logging_middleware(request: Request, call_next):
 @app.exception_handler(ProxyError)
 async def proxy_error_handler(request: Request, exc: ProxyError) -> JSONResponse:
     request.state.error_code = exc.code
+    request.state.failure_detail = exc.details.get("failure_detail")
+    if exc.details.get("tool_diagnostics") is not None:
+        request.state.tool_diagnostics = exc.details["tool_diagnostics"]
+    if exc.details.get("tool_call_diagnostics") is not None:
+        request.state.tool_call_diagnostics = exc.details["tool_call_diagnostics"]
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": {"message": exc.message, "type": "proxy_error", "code": exc.code}},
+        content={
+            "error": {
+                "message": exc.message,
+                "type": "proxy_error",
+                "code": exc.code,
+                **({"details": exc.details} if exc.details else {}),
+            }
+        },
     )
 
 
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     request.state.error_code = "request_validation_error"
+    request.state.failure_detail = "request_schema_validation"
     return JSONResponse(
         status_code=400,
         content={
@@ -350,6 +411,7 @@ async def request_validation_error_handler(request: Request, exc: RequestValidat
 async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
     if request.url.path == "/v1/responses" and exc.status_code == 400:
         request.state.error_code = "request_parse_error"
+        request.state.failure_detail = "request_parse_error"
         return JSONResponse(
             status_code=400,
             content={
@@ -391,8 +453,12 @@ async def responses_websocket(
     websocket.state.downstream_model = None
     websocket.state.stream = None
     websocket.state.error_code = None
+    websocket.state.failure_detail = None
+    websocket.state.tool_call_diagnostics = None
     websocket.state.tool_summary = None
+    websocket.state.tool_diagnostics = None
     websocket.state.upstream_summary = None
+    websocket.state.request_features = None
     websocket.state.request_kind = "responses_websocket"
     websocket.state.status_code = 101
     websocket.state.websocket_status = "accepted"
@@ -435,10 +501,23 @@ async def responses_websocket(
     except ProxyError as exc:
         websocket.state.status_code = exc.status_code
         websocket.state.error_code = exc.code
+        websocket.state.failure_detail = exc.details.get("failure_detail")
+        if exc.details.get("tool_diagnostics") is not None:
+            websocket.state.tool_diagnostics = exc.details["tool_diagnostics"]
+        if exc.details.get("tool_call_diagnostics") is not None:
+            websocket.state.tool_call_diagnostics = exc.details["tool_call_diagnostics"]
         websocket.state.websocket_status = "proxy_error"
         await websocket.send_text(
             json.dumps(
-                {"type": "error", "error": {"message": exc.message, "type": "proxy_error", "code": exc.code}},
+                {
+                    "type": "error",
+                    "error": {
+                        "message": exc.message,
+                        "type": "proxy_error",
+                        "code": exc.code,
+                        **({"details": exc.details} if exc.details else {}),
+                    },
+                },
                 separators=(",", ":"),
             )
         )

@@ -24,7 +24,12 @@ from app.schemas_responses import (
     ResponsesResponse,
 )
 from app.settings import Settings
-from app.tool_guard import validate_and_rewrite_tool_calls, validate_response_tools
+from app.tool_guard import (
+    ToolCompatibilityResult,
+    ToolCallValidationResult,
+    classify_response_tools,
+    validate_and_rewrite_tool_calls,
+)
 
 
 def _item_to_model(item: ResponseInputItem | dict[str, Any]) -> ResponseInputItem:
@@ -57,39 +62,152 @@ def _stringify_output(output: str | dict[str, Any] | list[Any] | None) -> str:
     return json.dumps(output, ensure_ascii=True)
 
 
-def _translate_tools(tools: list[ResponseTool] | None) -> list[ChatTool] | None:
-    registry = validate_response_tools(tools)
-    if not registry:
+def _strip_json_code_fence(content: str) -> str:
+    stripped = content.strip()
+    if not stripped.startswith("```"):
+        return stripped
+
+    lines = stripped.splitlines()
+    if len(lines) >= 3 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def _single_function_tool_name(tools: list[ResponseTool] | None) -> str | None:
+    names: list[str] = []
+    for tool in tools or []:
+        if tool.type != "function":
+            continue
+        name = tool.function.name if tool.function else tool.name
+        if name:
+            names.append(name)
+    if len(names) == 1:
+        return names[0]
+    return None
+
+
+def _schema_for_tool_name(tool_name: str, tools: list[ResponseTool] | None) -> dict[str, Any] | None:
+    for tool in tools or []:
+        if tool.type != "function":
+            continue
+        name = tool.function.name if tool.function else tool.name
+        if name == tool_name:
+            if tool.function:
+                return tool.function.parameters
+            return tool.parameters or {}
+    return None
+
+
+def _normalize_recovered_arguments(
+    tool_name: str,
+    arguments: str | dict[str, Any] | list[Any] | None,
+    tools: list[ResponseTool] | None,
+) -> str | dict[str, Any] | list[Any] | None:
+    if not isinstance(arguments, str):
+        return arguments
+
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+
+    schema = _schema_for_tool_name(tool_name, tools) or {}
+    properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    required = schema.get("required", []) if isinstance(schema, dict) else []
+
+    if "cmd" in properties:
+        return {"cmd": arguments}
+    if isinstance(required, list) and len(required) == 1 and required[0] in properties:
+        return {required[0]: arguments}
+    if len(properties) == 1:
+        only_property = next(iter(properties))
+        return {only_property: arguments}
+    return arguments
+
+
+def _recover_tool_calls_from_message_content(
+    content: str | None,
+    tools: list[ResponseTool] | None,
+) -> list[ChatToolCall] | None:
+    if not content:
         return None
-    translated: list[ChatTool] = []
-    for name, tool in registry.items():
-        function = tool.function or ResponseToolFunction(
-            name=name,
-            description=tool.description,
-            parameters=tool.parameters or {},
+
+    candidate = _strip_json_code_fence(content)
+    if not candidate:
+        return None
+
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+    tool_name: str | None = None
+    arguments: str | dict[str, Any] | None = None
+
+    if isinstance(parsed, list) and len(parsed) == 2 and isinstance(parsed[0], str):
+        tool_name = parsed[0]
+        arguments = parsed[1]
+    elif isinstance(parsed, dict):
+        if isinstance(parsed.get("function"), dict):
+            function = parsed["function"]
+            maybe_name = function.get("name")
+            if isinstance(maybe_name, str):
+                tool_name = maybe_name
+                arguments = function.get("arguments")
+        if tool_name is None:
+            maybe_name = parsed.get("name") or parsed.get("tool") or parsed.get("tool_name")
+            if isinstance(maybe_name, str):
+                tool_name = maybe_name
+                arguments = (
+                    parsed.get("arguments")
+                    or parsed.get("input")
+                    or parsed.get("parameters")
+                    or parsed.get("tool_input")
+                )
+        if tool_name is None:
+            tool_name = _single_function_tool_name(tools)
+            if tool_name is not None:
+                arguments = parsed
+
+    if not tool_name or arguments is None:
+        return None
+
+    arguments = _normalize_recovered_arguments(tool_name, arguments, tools)
+
+    if isinstance(arguments, str):
+        raw_arguments = arguments
+    else:
+        raw_arguments = json.dumps(arguments, separators=(",", ":"))
+
+    return [
+        ChatToolCall(
+            id=f"call_{uuid4().hex[:8]}",
+            type="function",
+            function=ChatToolFunctionCall(name=tool_name, arguments=raw_arguments),
         )
-        translated.append(
-            ChatTool(
-                type="function",
-                function={
-                    "name": function.name,
-                    "description": function.description,
-                    "parameters": function.parameters,
-                },
-            )
-        )
-    return translated
+    ]
 
 
-def _filter_translated_tools(tools: list[ChatTool] | None, settings: Settings) -> list[ChatTool] | None:
-    allowed = settings.debug_tool_name_set
-    if not tools or not allowed:
-        return tools
-    filtered = [tool for tool in tools if tool.function.name in allowed]
-    return filtered or None
+def build_tool_compatibility(
+    tools: list[ResponseTool] | None,
+    settings: Settings,
+    *,
+    require_forwardable: bool = False,
+) -> ToolCompatibilityResult:
+    return classify_response_tools(
+        tools,
+        allowed_function_names=settings.debug_tool_name_set,
+        require_forwardable=require_forwardable,
+    )
 
 
-def translate_responses_request_to_chat(request: ResponsesRequest, settings: Settings) -> ChatCompletionsRequest:
+def translate_responses_request_to_chat(
+    request: ResponsesRequest,
+    settings: Settings,
+    compatibility: ToolCompatibilityResult | None = None,
+) -> ChatCompletionsRequest:
     messages: list[ChatMessage] = []
     hidden_reasoning: list[str] = []
 
@@ -164,7 +282,7 @@ def translate_responses_request_to_chat(request: ResponsesRequest, settings: Set
         model=model,
         messages=messages,
         stream=False,
-        tools=_filter_translated_tools(_translate_tools(request.tools), settings),
+        tools=compatibility.forwarded_tools or None if compatibility is not None else build_tool_compatibility(request.tools, settings).forwarded_tools or None,
         tool_choice=request.tool_choice,
         temperature=request.temperature,
         top_p=request.top_p,
@@ -187,7 +305,7 @@ def _usage_from_chat(chat_response: ChatCompletionsResponse) -> ResponseUsageDet
 def translate_chat_response_to_responses(
     request: ResponsesRequest,
     chat_response: ChatCompletionsResponse,
-) -> ResponsesResponse:
+) -> tuple[ResponsesResponse, ToolCallValidationResult]:
     if not chat_response.choices:
         raise ProxyError(502, "invalid_upstream_payload", "Ollama returned no completion choices.")
 
@@ -204,9 +322,13 @@ def translate_chat_response_to_responses(
             )
         )
 
-    if message.tool_calls:
-        validated_calls = validate_and_rewrite_tool_calls(message.tool_calls, request.tools)
-        for validated in validated_calls:
+    recovered_tool_calls = None
+    if not message.tool_calls:
+        recovered_tool_calls = _recover_tool_calls_from_message_content(message.content, request.tools)
+
+    if message.tool_calls or recovered_tool_calls:
+        validation = validate_and_rewrite_tool_calls(message.tool_calls or recovered_tool_calls, request.tools)
+        for validated in validation.validated:
             output.append(
                 ResponseOutputItem(
                     id=validated.tool_call.id,
@@ -218,6 +340,17 @@ def translate_chat_response_to_responses(
                 )
             )
     else:
+        validation = ToolCallValidationResult(
+            validated=[],
+            diagnostics={
+                "attempted": 0,
+                "validated": 0,
+                "rewritten": 0,
+                "coercions": 0,
+                "dropped_extra_fields": 0,
+                "rewritten_names": 0,
+            },
+        )
         output.append(
             ResponseOutputItem(
                 id=f"msg_{uuid4().hex}",
@@ -234,12 +367,15 @@ def translate_chat_response_to_responses(
             )
         )
 
-    return ResponsesResponse(
-        id=chat_response.id.replace("chatcmpl", "resp", 1),
-        created_at=ResponsesResponse.now_iso(),
-        model=chat_response.model,
-        output=output,
-        usage=_usage_from_chat(chat_response),
+    return (
+        ResponsesResponse(
+            id=chat_response.id.replace("chatcmpl", "resp", 1),
+            created_at=ResponsesResponse.now_iso(),
+            model=chat_response.model,
+            output=output,
+            usage=_usage_from_chat(chat_response),
+        ),
+        validation,
     )
 
 
@@ -250,7 +386,10 @@ def build_response_events(response: ResponsesResponse) -> list[dict[str, Any]]:
     return [
         {"type": "response.created", "sequence_number": 0, "response": created_payload},
         {"type": "response.in_progress", "sequence_number": 1, "response": created_payload},
-        {"type": "response.completed", "sequence_number": 2, "response": payload},
+        {"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": payload["output"][0]}
+        if payload.get("output")
+        else {"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": None},
+        {"type": "response.completed", "sequence_number": 3, "response": payload},
     ]
 
 

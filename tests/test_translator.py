@@ -3,7 +3,7 @@ from __future__ import annotations
 from app.schemas_chat import ChatCompletionsResponse
 from app.schemas_responses import ResponsesRequest
 from app.settings import Settings
-from app.translator import translate_chat_response_to_responses, translate_responses_request_to_chat
+from app.translator import build_tool_compatibility, translate_chat_response_to_responses, translate_responses_request_to_chat
 
 
 def test_message_only_request_translates_to_chat() -> None:
@@ -90,6 +90,56 @@ def test_tool_list_translates_for_ollama_and_ignores_disabled_web_search() -> No
     assert translated.tools[1].function.parameters["required"] == ["cmd"]
 
 
+def test_mixed_tools_forward_only_function_tools() -> None:
+    request = ResponsesRequest(
+        input="tool?",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            },
+            {
+                "type": "web_search",
+                "external_web_access": False,
+            },
+            {
+                "type": "http",
+                "name": "fetch_docs",
+            },
+        ],
+    )
+    compatibility = build_tool_compatibility(request.tools, Settings(), require_forwardable=True)
+    translated = translate_responses_request_to_chat(request, Settings(), compatibility)
+    assert translated.tools is not None
+    assert [tool.function.name for tool in translated.tools] == ["read_file"]
+    assert compatibility.as_log_payload()["counts"]["hosted_tool_observed_not_executed"] == 1
+
+
+def test_only_hosted_tools_are_classified_and_not_forwarded() -> None:
+    compatibility = build_tool_compatibility(
+        ResponsesRequest(input="tool?", tools=[{"type": "http", "name": "fetch_docs"}]).tools,
+        Settings(),
+    )
+    assert compatibility.forwarded_tools == []
+    assert compatibility.as_log_payload()["counts"]["hosted_tool_observed_not_executed"] == 1
+
+
+def test_only_disabled_web_search_tools_are_classified_and_not_forwarded() -> None:
+    compatibility = build_tool_compatibility(
+        ResponsesRequest(input="tool?", tools=[{"type": "web_search", "external_web_access": False}]).tools,
+        Settings(),
+    )
+    assert compatibility.forwarded_tools == []
+    assert compatibility.as_log_payload()["counts"]["web_search_disabled_ignored"] == 1
+
+
 def test_debug_tool_name_filter_keeps_only_named_tool() -> None:
     request = ResponsesRequest(
         input="tool?",
@@ -142,11 +192,12 @@ def test_chat_text_response_translates_to_responses() -> None:
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }
     )
-    translated = translate_chat_response_to_responses(request, chat_response)
+    translated, validation = translate_chat_response_to_responses(request, chat_response)
     assert translated.object == "response"
     assert translated.output[0].type == "message"
     assert translated.output[0].content[0]["text"] == "hello"
     assert translated.usage.total_tokens == 15
+    assert validation.diagnostics["attempted"] == 0
 
 
 def test_chat_tool_call_translates_to_responses() -> None:
@@ -192,6 +243,146 @@ def test_chat_tool_call_translates_to_responses() -> None:
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }
     )
-    translated = translate_chat_response_to_responses(request, chat_response)
+    translated, validation = translate_chat_response_to_responses(request, chat_response)
     assert translated.output[0].type == "function_call"
     assert translated.output[0].name == "get_weather"
+    assert validation.diagnostics["validated"] == 1
+
+
+def test_chat_text_json_object_recovers_single_tool_call() -> None:
+    request = ResponsesRequest(
+        input="tool?",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+    chat_response = ChatCompletionsResponse.model_validate(
+        {
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "nemotron-3-nano:4b",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"command":"pwd","timeout":5}',
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+    )
+
+    translated, validation = translate_chat_response_to_responses(request, chat_response)
+
+    assert translated.output[0].type == "function_call"
+    assert translated.output[0].name == "exec_command"
+    assert translated.output[0].arguments == '{"cmd":"pwd"}'
+    assert validation.diagnostics["validated"] == 1
+    assert validation.diagnostics["dropped_extra_fields"] == 1
+
+
+def test_chat_text_json_array_recovers_named_tool_call() -> None:
+    request = ResponsesRequest(
+        input="tool?",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+    chat_response = ChatCompletionsResponse.model_validate(
+        {
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "nemotron-3-nano:4b",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": '["exec_command", {"command":"pwd"}]',
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+    )
+
+    translated, validation = translate_chat_response_to_responses(request, chat_response)
+
+    assert translated.output[0].type == "function_call"
+    assert translated.output[0].name == "exec_command"
+    assert translated.output[0].arguments == '{"cmd":"pwd"}'
+    assert validation.diagnostics["validated"] == 1
+
+
+def test_chat_text_fenced_tool_name_and_input_recovers_tool_call() -> None:
+    request = ResponsesRequest(
+        input="tool?",
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                            "workdir": {"type": "string"},
+                        },
+                        "required": ["cmd"],
+                    },
+                },
+            }
+        ],
+    )
+    chat_response = ChatCompletionsResponse.model_validate(
+        {
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "nemotron-3-nano:4b",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": '```json\n{"tool_name":"exec_command","tool_input":"pwd"}\n```',
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }
+    )
+
+    translated, validation = translate_chat_response_to_responses(request, chat_response)
+
+    assert translated.output[0].type == "function_call"
+    assert translated.output[0].name == "exec_command"
+    assert translated.output[0].arguments == '{"cmd":"pwd"}'
+    assert validation.diagnostics["validated"] == 1

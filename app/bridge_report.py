@@ -23,6 +23,15 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def _sum_numeric(records: list[dict[str, Any]], key: str) -> int:
+    total = 0
+    for record in records:
+        value = record.get(key)
+        if isinstance(value, int):
+            total += value
+    return total
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Summarize recent codex-bridge runs.")
     parser.add_argument("--log-dir", default=None)
@@ -55,11 +64,28 @@ def main() -> None:
         request_count = len(related)
         statuses = Counter(str(record.get("status_code")) for record in related if record.get("status_code") is not None)
         request_kinds = Counter(str(record.get("request_kind")) for record in related if record.get("request_kind"))
+        failure_details = Counter(str(record.get("failure_detail")) for record in related if record.get("failure_detail"))
+        tool_dispositions = Counter()
+        for record in related:
+            tool_diagnostics = record.get("tool_diagnostics")
+            if not isinstance(tool_diagnostics, dict):
+                continue
+            counts = tool_diagnostics.get("counts")
+            if not isinstance(counts, dict):
+                continue
+            for key, value in counts.items():
+                if isinstance(value, int):
+                    tool_dispositions[key] += value
         note = ""
         if request_count and request_kinds.get("responses_http", 0) == 0 and request_kinds.get("responses_websocket", 0) == 0:
             note = " note=no_http_post_seen"
         print(
             f"{run_id} {run['status']} exit={run['exit_code']} "
             f"requests={request_count} failures={dict(failure_counts)} statuses={dict(statuses)} "
-            f"kinds={dict(request_kinds)}{note}"
+            f"kinds={dict(request_kinds)} failure_details={dict(failure_details)} "
+            f"tools={{'observed': {_sum_numeric(related, 'tool_count_observed')}, "
+            f"'forwarded': {_sum_numeric(related, 'tool_count_forwarded')}, "
+            f"'ignored': {_sum_numeric(related, 'tool_count_ignored')}, "
+            f"'rejected': {_sum_numeric(related, 'tool_count_rejected')}, "
+            f"'dispositions': {dict(tool_dispositions)}}}{note}"
         )

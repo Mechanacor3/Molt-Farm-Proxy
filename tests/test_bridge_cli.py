@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sys
 
+from app import bridge_report
 from app.bridge_cli import build_codex_command
 from app.devloop import base_run_payload, classify_proxy_failure, generate_run_id
 
@@ -51,6 +53,7 @@ def test_failure_classification_covers_expected_paths() -> None:
     assert classify_proxy_failure(400, "request_validation_error", "POST") == "schema_mismatch"
     assert classify_proxy_failure(400, "request_parse_error", "POST") == "schema_mismatch"
     assert classify_proxy_failure(400, "unsupported_tool", "POST") == "unsupported_tool"
+    assert classify_proxy_failure(400, "no_forwardable_tools", "POST") == "unsupported_tool"
     assert classify_proxy_failure(502, "upstream_bad_status", "POST") == "upstream_ollama_failure"
     assert classify_proxy_failure(422, "invalid_tool_call", "POST") == "proxy_validation_failure"
 
@@ -60,3 +63,53 @@ def test_base_run_payload_is_stable() -> None:
     assert payload["run_id"] == "bridge-123"
     assert payload["mode"] == "cli"
     assert payload["model"] == "codex-bridge"
+
+
+def test_bridge_report_surfaces_tool_breakdowns(tmp_path, capsys, monkeypatch) -> None:
+    (tmp_path / "bridge-runs.jsonl").write_text(
+        json.dumps(
+            {
+                "run_id": "bridge-123",
+                "event": "run_finished",
+                "status": "failed",
+                "exit_code": 1,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "proxy-requests.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "bridge_run_id": "bridge-123",
+                        "status_code": 400,
+                        "request_kind": "responses_http",
+                        "failure_class": "unsupported_tool",
+                        "failure_detail": "tool_definition_policy_error",
+                        "tool_count_observed": 2,
+                        "tool_count_forwarded": 1,
+                        "tool_count_ignored": 1,
+                        "tool_count_rejected": 0,
+                        "tool_diagnostics": {
+                            "counts": {
+                                "observed": 2,
+                                "function_forwarded": 1,
+                                "hosted_tool_observed_not_executed": 1,
+                            }
+                        },
+                    }
+                )
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(sys, "argv", ["codex-bridge-report", "--log-dir", str(tmp_path), "--limit", "1"])
+    bridge_report.main()
+    output = capsys.readouterr().out
+    assert "failure_details={'tool_definition_policy_error': 1}" in output
+    assert "'forwarded': 1" in output
+    assert "'hosted_tool_observed_not_executed': 1" in output
