@@ -4,8 +4,8 @@ import json
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 import zstandard as zstd
+from fastapi.testclient import TestClient
 
 from app.devloop import request_log_path
 from app.main import app, get_ollama_client
@@ -15,19 +15,25 @@ from app.settings import get_settings
 
 class FakeOllamaClient:
     def __init__(self, payload: dict[str, Any]) -> None:
+        """Store the canned payload and remember the last request for assertions."""
         self.payload = payload
         self.last_request: ChatCompletionsRequest | None = None
 
     async def close(self) -> None:
+        """Match the real client shutdown API without doing any work."""
         return None
 
-    async def create_chat_completion(self, request: ChatCompletionsRequest) -> ChatCompletionsResponse:
+    async def create_chat_completion(
+        self, request: ChatCompletionsRequest
+    ) -> ChatCompletionsResponse:
+        """Capture the translated request and return the canned upstream payload."""
         self.last_request = request
         return ChatCompletionsResponse.model_validate(self.payload)
 
 
 @pytest.fixture
 def client() -> TestClient:
+    """Create a test client with the Ollama dependency overridden by a fake."""
     fake = FakeOllamaClient(
         {
             "id": "chatcmpl-1",
@@ -35,7 +41,11 @@ def client() -> TestClient:
             "created": 1,
             "model": "nemotron-3-nano:4b",
             "choices": [
-                {"index": 0, "message": {"role": "assistant", "content": "pong"}, "finish_reason": "stop"}
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "pong"},
+                    "finish_reason": "stop",
+                }
             ],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }
@@ -52,22 +62,26 @@ def client() -> TestClient:
 
 @pytest.fixture(autouse=True)
 def clear_settings_cache() -> None:
+    """Reset cached settings around each test so env overrides stay isolated."""
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
 
 
 def _zstd_json(payload: dict[str, Any]) -> bytes:
+    """Compress a JSON payload the same way the real fallback client does."""
     return zstd.ZstdCompressor().compress(json.dumps(payload).encode("utf-8"))
 
 
 def test_healthz(client: TestClient) -> None:
+    """The health endpoint should report liveness and the default model."""
     response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
 
 
 def test_non_streaming_response(client: TestClient) -> None:
+    """A basic non-streaming Responses request should round-trip to text output."""
     response = client.post("/v1/responses", json={"input": "ping", "stream": False})
     assert response.status_code == 200
     body = response.json()
@@ -76,8 +90,14 @@ def test_non_streaming_response(client: TestClient) -> None:
 
 
 def test_streaming_response_returns_final_sse(client: TestClient) -> None:
-    with client.stream("POST", "/v1/responses", json={"input": "ping", "stream": True}) as response:
-        text = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in response.iter_text())
+    """Streaming Responses calls should emit the typed SSE event sequence plus DONE."""
+    with client.stream(
+        "POST", "/v1/responses", json={"input": "ping", "stream": True}
+    ) as response:
+        text = "".join(
+            chunk.decode() if isinstance(chunk, bytes) else chunk
+            for chunk in response.iter_text()
+        )
     assert response.status_code == 200
     assert '"type":"response.created"' in text
     assert '"type":"response.output_item.added"' in text
@@ -86,6 +106,7 @@ def test_streaming_response_returns_final_sse(client: TestClient) -> None:
 
 
 def test_zstd_streaming_real_client_shape(client: TestClient) -> None:
+    """The proxy should decode zstd requests and preserve Codex role translation."""
     payload = {
         "model": "codex-bridge",
         "instructions": "System instructions",
@@ -133,7 +154,10 @@ def test_zstd_streaming_real_client_shape(client: TestClient) -> None:
             "accept": "text/event-stream",
         },
     ) as response:
-        text = "".join(chunk.decode() if isinstance(chunk, bytes) else chunk for chunk in response.iter_text())
+        text = "".join(
+            chunk.decode() if isinstance(chunk, bytes) else chunk
+            for chunk in response.iter_text()
+        )
 
     assert response.status_code == 200
     assert '"type":"response.completed"' in text
@@ -150,6 +174,7 @@ def test_zstd_streaming_real_client_shape(client: TestClient) -> None:
 
 
 def test_unsupported_tool_rejected(client: TestClient) -> None:
+    """Hosted-only tools should fail with the no-forwardable-tools policy error."""
     response = client.post(
         "/v1/responses",
         json={"input": "ping", "tools": [{"type": "web_search_preview"}]},
@@ -158,7 +183,10 @@ def test_unsupported_tool_rejected(client: TestClient) -> None:
     assert response.json()["error"]["code"] == "no_forwardable_tools"
 
 
-def test_hosted_tool_is_observed_but_ignored_when_function_tool_exists(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_hosted_tool_is_observed_but_ignored_when_function_tool_exists(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Hosted tools should be logged but ignored when a forwardable function tool exists."""
     monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
     get_settings.cache_clear()
 
@@ -183,12 +211,20 @@ def test_hosted_tool_is_observed_but_ignored_when_function_tool_exists(client: T
 
     assert response.status_code == 200
     log_path = request_log_path(tmp_path)
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-    assert entries[-1]["tool_diagnostics"]["counts"]["hosted_tool_observed_not_executed"] == 1
+    entries = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert (
+        entries[-1]["tool_diagnostics"]["counts"]["hosted_tool_observed_not_executed"]
+        == 1
+    )
     assert entries[-1]["tool_diagnostics"]["counts"]["function_forwarded"] == 1
 
 
-def test_only_hosted_tool_returns_specific_policy_error(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_only_hosted_tool_returns_specific_policy_error(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A request with only hosted tools should log and return the policy failure detail."""
     monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
     get_settings.cache_clear()
 
@@ -199,22 +235,31 @@ def test_only_hosted_tool_returns_specific_policy_error(client: TestClient, monk
 
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "no_forwardable_tools"
-    assert response.json()["error"]["details"]["failure_detail"] == "tool_definition_policy_error"
+    assert (
+        response.json()["error"]["details"]["failure_detail"]
+        == "tool_definition_policy_error"
+    )
 
     log_path = request_log_path(tmp_path)
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    entries = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert entries[-1]["failure_detail"] == "tool_definition_policy_error"
 
 
 def test_get_probe_returns_structured_transport_error(client: TestClient) -> None:
+    """GET probe traffic should return the explicit websocket-not-supported error."""
     response = client.get("/v1/responses")
     assert response.status_code == 405
     assert response.json()["error"]["code"] == "websocket_not_supported"
 
 
 def test_websocket_response_create_streams_events(client: TestClient) -> None:
+    """A websocket response.create frame should stream the typed event sequence."""
     with client.websocket_connect("/v1/responses") as websocket:
-        websocket.send_json({"type": "response.create", "input": "ping", "stream": True})
+        websocket.send_json(
+            {"type": "response.create", "input": "ping", "stream": True}
+        )
         created = json.loads(websocket.receive_text())
         in_progress = json.loads(websocket.receive_text())
         output_added = json.loads(websocket.receive_text())
@@ -228,6 +273,7 @@ def test_websocket_response_create_streams_events(client: TestClient) -> None:
 
 
 def test_websocket_invalid_first_message_returns_error(client: TestClient) -> None:
+    """Non-JSON websocket payloads should surface the parse error shape."""
     with client.websocket_connect("/v1/responses") as websocket:
         websocket.send_text("not-json")
         payload = json.loads(websocket.receive_text())
@@ -237,6 +283,7 @@ def test_websocket_invalid_first_message_returns_error(client: TestClient) -> No
 
 
 def test_websocket_invalid_message_type_returns_error(client: TestClient) -> None:
+    """Unsupported websocket message types should return a structured error event."""
     with client.websocket_connect("/v1/responses") as websocket:
         websocket.send_json({"type": "response.cancel"})
         payload = json.loads(websocket.receive_text())
@@ -246,8 +293,11 @@ def test_websocket_invalid_message_type_returns_error(client: TestClient) -> Non
 
 
 def test_websocket_validation_error_returns_error(client: TestClient) -> None:
+    """Invalid websocket request bodies should return the validation error event."""
     with client.websocket_connect("/v1/responses") as websocket:
-        websocket.send_json({"type": "response.create", "input": {"unexpected": "shape"}})
+        websocket.send_json(
+            {"type": "response.create", "input": {"unexpected": "shape"}}
+        )
         payload = json.loads(websocket.receive_text())
 
     assert payload["type"] == "error"
@@ -255,12 +305,14 @@ def test_websocket_validation_error_returns_error(client: TestClient) -> None:
 
 
 def test_request_validation_error_is_structured(client: TestClient) -> None:
+    """HTTP validation failures should use the structured proxy error payload."""
     response = client.post("/v1/responses", json={"input": {"unexpected": "shape"}})
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "request_validation_error"
 
 
 def test_invalid_zstd_request_body_is_structured(client: TestClient) -> None:
+    """Bad zstd payloads should fail with the structured parse error."""
     response = client.post(
         "/v1/responses",
         content=b"not-a-zstd-frame",
@@ -271,6 +323,7 @@ def test_invalid_zstd_request_body_is_structured(client: TestClient) -> None:
 
 
 def test_zstd_request_validation_error_is_structured(client: TestClient) -> None:
+    """Decoded zstd payloads should still surface schema validation errors cleanly."""
     response = client.post(
         "/v1/responses",
         content=_zstd_json({"input": {"unexpected": "shape"}}),
@@ -280,7 +333,10 @@ def test_zstd_request_validation_error_is_structured(client: TestClient) -> None
     assert response.json()["error"]["code"] == "request_validation_error"
 
 
-def test_failed_post_parsing_is_logged(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_failed_post_parsing_is_logged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Request-parse failures should still produce a structured request log entry."""
     monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
     get_settings.cache_clear()
 
@@ -293,13 +349,18 @@ def test_failed_post_parsing_is_logged(client: TestClient, monkeypatch: pytest.M
     assert response.status_code == 400
 
     log_path = request_log_path(tmp_path)
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    entries = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert entries[-1]["error_code"] == "request_parse_error"
     assert entries[-1]["failure_class"] == "schema_mismatch"
     assert entries[-1]["status_code"] == 400
 
 
-def test_zstd_request_logs_decoded_tool_summary(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_zstd_request_logs_decoded_tool_summary(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Decoded zstd requests should log a summary of observed tool definitions."""
     monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
     get_settings.cache_clear()
 
@@ -338,7 +399,9 @@ def test_zstd_request_logs_decoded_tool_summary(client: TestClient, monkeypatch:
     assert response.status_code == 200
 
     log_path = request_log_path(tmp_path)
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    entries = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert entries[-1]["tool_summary"] == [
         {
             "type": "web_search",
@@ -365,7 +428,10 @@ def test_zstd_request_logs_decoded_tool_summary(client: TestClient, monkeypatch:
     assert entries[-1]["tool_diagnostics"]["counts"]["function_forwarded"] == 1
 
 
-def test_request_log_includes_upstream_tool_use_summary(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_request_log_includes_upstream_tool_use_summary(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Successful tool use should be summarized in the structured request log."""
     fake = FakeOllamaClient(
         {
             "id": "chatcmpl-2",
@@ -382,7 +448,10 @@ def test_request_log_includes_upstream_tool_use_summary(client: TestClient, monk
                             {
                                 "id": "call_1",
                                 "type": "function",
-                                "function": {"name": "read_file", "arguments": '{"path":"README.md"}'},
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path":"README.md"}',
+                                },
                             }
                         ],
                     },
@@ -421,7 +490,9 @@ def test_request_log_includes_upstream_tool_use_summary(client: TestClient, monk
     assert response.status_code == 200
 
     log_path = request_log_path(tmp_path)
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    entries = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert entries[-1]["upstream_summary"] == {
         "tool_count": 1,
         "tool_names": ["read_file"],
@@ -452,7 +523,10 @@ def test_request_log_includes_upstream_tool_use_summary(client: TestClient, monk
     }
 
 
-def test_textual_tool_call_is_recovered_into_responses_function_call(client: TestClient) -> None:
+def test_textual_tool_call_is_recovered_into_responses_function_call(
+    client: TestClient,
+) -> None:
+    """JSON text output should be recovered into a validated function call."""
     fake = FakeOllamaClient(
         {
             "id": "chatcmpl-2",
@@ -503,6 +577,7 @@ def test_textual_tool_call_is_recovered_into_responses_function_call(client: Tes
 
 
 def test_fenced_tool_name_tool_input_is_recovered(client: TestClient) -> None:
+    """Fenced JSON with tool_name/tool_input should be recovered into a function call."""
     fake = FakeOllamaClient(
         {
             "id": "chatcmpl-2",
@@ -551,7 +626,10 @@ def test_fenced_tool_name_tool_input_is_recovered(client: TestClient) -> None:
     assert body["output"][0]["arguments"] == '{"cmd":"pwd"}'
 
 
-def test_debug_tool_filter_reduces_forwarded_tool_names(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_debug_tool_filter_reduces_forwarded_tool_names(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The debug tool allowlist should reduce the forwarded tool set and log summary."""
     monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
     monkeypatch.setenv("MOLT_DEBUG_TOOL_NAMES", "exec_command")
     get_settings.cache_clear()
@@ -587,12 +665,15 @@ def test_debug_tool_filter_reduces_forwarded_tool_names(client: TestClient, monk
     assert response.status_code == 200
 
     log_path = request_log_path(tmp_path)
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    entries = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert entries[-1]["upstream_summary"]["tool_count"] == 1
     assert entries[-1]["upstream_summary"]["tool_names"] == ["exec_command"]
 
 
 def test_non_utf8_request_body_does_not_crash(client: TestClient) -> None:
+    """Non-UTF-8 request bodies should fail cleanly instead of crashing the app."""
     response = client.post(
         "/v1/responses",
         content=b"\xb5\x00\x01",
@@ -602,7 +683,10 @@ def test_non_utf8_request_body_does_not_crash(client: TestClient) -> None:
     assert response.json()["error"]["code"] == "request_parse_error"
 
 
-def test_request_features_log_recognized_ignored_fields(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_request_features_log_recognized_ignored_fields(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Known ignored request fields should be summarized in the request log."""
     monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
     get_settings.cache_clear()
 
@@ -620,14 +704,24 @@ def test_request_features_log_recognized_ignored_fields(client: TestClient, monk
     assert response.status_code == 200
 
     log_path = request_log_path(tmp_path)
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    entries = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert entries[-1]["request_features"] == {
-        "recognized_ignored_fields": ["include", "parallel_tool_calls", "prompt_cache_key", "store"],
+        "recognized_ignored_fields": [
+            "include",
+            "parallel_tool_calls",
+            "prompt_cache_key",
+            "store",
+        ],
         "count": 4,
     }
 
 
-def test_invalid_upstream_tool_call_logs_failure_detail(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_invalid_upstream_tool_call_logs_failure_detail(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Invalid upstream tool calls should preserve the proxy validation failure detail."""
     fake = FakeOllamaClient(
         {
             "id": "chatcmpl-3",
@@ -644,7 +738,10 @@ def test_invalid_upstream_tool_call_logs_failure_detail(client: TestClient, monk
                             {
                                 "id": "call_1",
                                 "type": "function",
-                                "function": {"name": "read_file", "arguments": '{"extra":"no-path"}'},
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"extra":"no-path"}',
+                                },
                             }
                         ],
                     },
@@ -679,25 +776,37 @@ def test_invalid_upstream_tool_call_logs_failure_detail(client: TestClient, monk
     )
 
     assert response.status_code == 422
-    assert response.json()["error"]["details"]["failure_detail"] == "upstream_selected_invalid_tool"
+    assert (
+        response.json()["error"]["details"]["failure_detail"]
+        == "upstream_selected_invalid_tool"
+    )
 
     log_path = request_log_path(tmp_path)
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    entries = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert entries[-1]["failure_detail"] == "upstream_selected_invalid_tool"
 
 
-def test_websocket_request_is_logged(client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+def test_websocket_request_is_logged(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Completed websocket requests should be written to the structured log."""
     monkeypatch.setenv("MOLT_LOG_DIR", str(tmp_path))
     get_settings.cache_clear()
 
     with client.websocket_connect("/v1/responses") as websocket:
-        websocket.send_json({"type": "response.create", "input": "ping", "stream": True})
+        websocket.send_json(
+            {"type": "response.create", "input": "ping", "stream": True}
+        )
         websocket.receive_text()
         websocket.receive_text()
         websocket.receive_text()
 
     log_path = request_log_path(tmp_path)
-    entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+    entries = [
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+    ]
     entry = entries[-1]
     assert entry["request_kind"] == "responses_websocket"
     assert entry["websocket_status"] == "completed"

@@ -8,6 +8,7 @@ import httpx
 
 
 def build_tool() -> dict[str, Any]:
+    """Return the single get_weather tool schema used by this probe."""
     return {
         "type": "function",
         "name": "get_weather",
@@ -29,6 +30,7 @@ def send_response_request(
     model: str,
     input_items: str | list[dict[str, Any]],
 ) -> dict[str, Any]:
+    """Send one non-streaming request to the proxy Responses endpoint."""
     response = client.post(
         f"{base_url}/v1/responses",
         json={
@@ -50,6 +52,7 @@ def send_chat_request(
     model: str,
     messages: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    """Send one non-streaming request directly to chat completions."""
     response = client.post(
         f"{base_url}/v1/chat/completions",
         json={
@@ -66,6 +69,7 @@ def send_chat_request(
 
 
 def first_function_call(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the first Responses function call item if one exists."""
     for item in payload.get("output", []):
         if item.get("type") == "function_call":
             return item
@@ -73,6 +77,7 @@ def first_function_call(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def first_chat_tool_call(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the first chat-completions tool call if one exists."""
     choices = payload.get("choices") or []
     if not choices:
         return None
@@ -84,12 +89,16 @@ def first_chat_tool_call(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def responses_tool_output_value(tool_output: Any) -> str:
+    """Convert fake tool output into the string form Responses expects."""
     if isinstance(tool_output, str):
         return tool_output
     return json.dumps(tool_output)
 
 
-def build_responses_followup_input(prompt: str, call: dict[str, Any], tool_output: Any) -> list[dict[str, Any]]:
+def build_responses_followup_input(
+    prompt: str, call: dict[str, Any], tool_output: Any
+) -> list[dict[str, Any]]:
+    """Build the Responses follow-up turn that injects the fake tool result."""
     return [
         {"type": "message", "role": "user", "content": prompt},
         {
@@ -106,7 +115,14 @@ def build_responses_followup_input(prompt: str, call: dict[str, Any], tool_outpu
     ]
 
 
-def run_responses_mode(client: httpx.Client, base_url: str, model: str, prompt: str, tool_output: dict[str, Any]) -> None:
+def run_responses_mode(
+    client: httpx.Client,
+    base_url: str,
+    model: str,
+    prompt: str,
+    tool_output: dict[str, Any],
+) -> None:
+    """Exercise the proxy Responses surface and print both turns."""
     first = send_response_request(client, base_url, model, prompt)
     print("=== First response ===")
     print(json.dumps(first, indent=2))
@@ -127,7 +143,14 @@ def run_responses_mode(client: httpx.Client, base_url: str, model: str, prompt: 
     print(json.dumps(second, indent=2))
 
 
-def run_chat_mode(client: httpx.Client, base_url: str, model: str, prompt: str, tool_output: dict[str, Any]) -> None:
+def run_chat_mode(
+    client: httpx.Client,
+    base_url: str,
+    model: str,
+    prompt: str,
+    tool_output: dict[str, Any],
+) -> None:
+    """Exercise the direct chat surface and print both turns."""
     first = send_chat_request(
         client,
         base_url,
@@ -171,15 +194,24 @@ def run_chat_mode(client: httpx.Client, base_url: str, model: str, prompt: str, 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Probe the proxy with one get_weather function tool.")
+    """Run the selected weather probe mode with a fake tool result payload."""
+    parser = argparse.ArgumentParser(
+        description="Probe the proxy with one get_weather function tool."
+    )
     parser.add_argument(
         "--mode",
         choices=["responses", "chat"],
         default="responses",
         help="Use the proxy Responses endpoint or hit chat completions directly.",
     )
-    parser.add_argument("--base-url", default=None, help="Base URL for the selected mode.")
-    parser.add_argument("--model", default="codex-bridge", help="Model name to send in the Responses request.")
+    parser.add_argument(
+        "--base-url", default=None, help="Base URL for the selected mode."
+    )
+    parser.add_argument(
+        "--model",
+        default="codex-bridge",
+        help="Model name to send in the Responses request.",
+    )
     parser.add_argument("--city", default="Boston", help="City to ask about.")
     parser.add_argument(
         "--prompt",
@@ -196,7 +228,9 @@ def main() -> None:
     prompt = args.prompt.format(city=args.city)
     tool_output = json.loads(args.tool_json)
     base_url = args.base_url or (
-        "http://127.0.0.1:8000" if args.mode == "responses" else "http://127.0.0.1:11434"
+        "http://127.0.0.1:8000"
+        if args.mode == "responses"
+        else "http://127.0.0.1:11434"
     )
 
     with httpx.Client() as client:

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.errors import ProxyError
-from app.schemas_chat import ChatTool, ChatToolCall, ChatToolFunctionCall
+from app.schemas_chat import ChatTool, ChatToolCall
 from app.schemas_responses import ResponseTool, ResponseToolFunction
 
 KNOWN_HOSTED_TOOL_TYPES = {
@@ -56,7 +56,10 @@ class ToolCompatibilityResult:
     entries: list[ToolCompatibilityEntry] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
 
-    def add_entry(self, tool_type: str | None, name: str | None, disposition: str, detail: str) -> None:
+    def add_entry(
+        self, tool_type: str | None, name: str | None, disposition: str, detail: str
+    ) -> None:
+        """Record one observed tool and increment the matching disposition count."""
         self.entries.append(
             ToolCompatibilityEntry(
                 tool_type=tool_type,
@@ -68,6 +71,7 @@ class ToolCompatibilityResult:
         self.counts[disposition] = self.counts.get(disposition, 0) + 1
 
     def as_log_payload(self) -> dict[str, Any]:
+        """Build the compact diagnostics payload stored in request logs."""
         return {
             "counts": {
                 "observed": len(self.entries),
@@ -104,18 +108,22 @@ class ToolCallValidationResult:
 
 
 def _normalize_name(name: str) -> str:
+    """Normalize tool names for loose matching across punctuation changes."""
     return re.sub(r"[^a-z0-9]+", "", name.lower())
 
 
 def _function_tool_name(tool: ResponseTool) -> str | None:
+    """Read the effective function name from either supported tool shape."""
     return tool.function.name if tool.function else tool.name
 
 
 def _function_tool_parameters(tool: ResponseTool) -> dict[str, Any] | None:
+    """Read the effective JSON schema from either supported tool shape."""
     return tool.function.parameters if tool.function else tool.parameters
 
 
 def _build_forwarded_chat_tool(tool: ResponseTool, definition_name: str) -> ChatTool:
+    """Convert a Responses function tool into the chat-completions tool shape."""
     function = tool.function or ResponseToolFunction(
         name=definition_name,
         description=tool.description,
@@ -137,6 +145,13 @@ def classify_response_tools(
     allowed_function_names: set[str] | None = None,
     require_forwardable: bool = False,
 ) -> ToolCompatibilityResult:
+    """Classify which Responses tools can be forwarded to Ollama safely.
+
+    The algorithm walks each advertised tool once, records what was observed
+    for logging, forwards only function tools with compatible object schemas,
+    ignores intentionally disabled hosted tools, and raises structured errors
+    as soon as a tool definition would make the request ambiguous or unsafe.
+    """
     result = ToolCompatibilityResult()
     if not tools:
         return result
@@ -147,9 +162,19 @@ def classify_response_tools(
         if tool_type == "web_search":
             extra = tool.model_extra or {}
             if extra.get("external_web_access") is False:
-                result.add_entry(tool_type, name, "web_search_disabled_ignored", "external access disabled")
+                result.add_entry(
+                    tool_type,
+                    name,
+                    "web_search_disabled_ignored",
+                    "external access disabled",
+                )
                 continue
-            result.add_entry(tool_type, name, "unsupported_tool_rejected", "external web access not supported")
+            result.add_entry(
+                tool_type,
+                name,
+                "unsupported_tool_rejected",
+                "external web access not supported",
+            )
             raise ProxyError(
                 400,
                 "unsupported_tool",
@@ -160,10 +185,20 @@ def classify_response_tools(
                 },
             )
         if tool_type in KNOWN_HOSTED_TOOL_TYPES:
-            result.add_entry(tool_type, name, "hosted_tool_observed_not_executed", "hosted tool observed and not executed")
+            result.add_entry(
+                tool_type,
+                name,
+                "hosted_tool_observed_not_executed",
+                "hosted tool observed and not executed",
+            )
             continue
         if tool_type != "function":
-            result.add_entry(tool_type, name, "unsupported_tool_rejected", "tool type cannot be bridged over chat completions")
+            result.add_entry(
+                tool_type,
+                name,
+                "unsupported_tool_rejected",
+                "tool type cannot be bridged over chat completions",
+            )
             raise ProxyError(
                 400,
                 "unsupported_tool",
@@ -181,7 +216,12 @@ def classify_response_tools(
         definition_name = name
         parameters = _function_tool_parameters(tool)
         if not definition_name:
-            result.add_entry(tool_type, definition_name, "unsupported_tool_rejected", "function tool is missing a name")
+            result.add_entry(
+                tool_type,
+                definition_name,
+                "unsupported_tool_rejected",
+                "function tool is missing a name",
+            )
             raise ProxyError(
                 400,
                 "invalid_tool",
@@ -192,7 +232,12 @@ def classify_response_tools(
                 },
             )
         if definition_name in result.forwarded_registry:
-            result.add_entry(tool_type, definition_name, "unsupported_tool_rejected", "duplicate function tool name")
+            result.add_entry(
+                tool_type,
+                definition_name,
+                "unsupported_tool_rejected",
+                "duplicate function tool name",
+            )
             raise ProxyError(
                 400,
                 "invalid_tool",
@@ -205,7 +250,12 @@ def classify_response_tools(
         if parameters is None:
             parameters = {}
         if not isinstance(parameters, dict):
-            result.add_entry(tool_type, definition_name, "unsupported_tool_rejected", "function parameters are not an object")
+            result.add_entry(
+                tool_type,
+                definition_name,
+                "unsupported_tool_rejected",
+                "function parameters are not an object",
+            )
             raise ProxyError(
                 400,
                 "invalid_tool",
@@ -232,13 +282,26 @@ def classify_response_tools(
                 },
             )
 
-        if allowed_function_names is not None and definition_name not in allowed_function_names:
-            result.add_entry(tool_type, definition_name, "function_filtered", "filtered by debug tool allowlist")
+        if (
+            allowed_function_names is not None
+            and definition_name not in allowed_function_names
+        ):
+            result.add_entry(
+                tool_type,
+                definition_name,
+                "function_filtered",
+                "filtered by debug tool allowlist",
+            )
             continue
 
         result.forwarded_registry[definition_name] = tool
         result.forwarded_tools.append(_build_forwarded_chat_tool(tool, definition_name))
-        result.add_entry(tool_type, definition_name, "function_forwarded", "forwarded to chat completions")
+        result.add_entry(
+            tool_type,
+            definition_name,
+            "function_forwarded",
+            "forwarded to chat completions",
+        )
 
     if require_forwardable and tools and not result.forwarded_tools:
         raise ProxyError(
@@ -253,11 +316,15 @@ def classify_response_tools(
     return result
 
 
-def validate_response_tools(tools: list[ResponseTool] | None) -> dict[str, ResponseTool]:
+def validate_response_tools(
+    tools: list[ResponseTool] | None,
+) -> dict[str, ResponseTool]:
+    """Return only the forwarded function-tool registry for a request."""
     return classify_response_tools(tools).forwarded_registry
 
 
 def _parse_arguments(raw: str) -> dict[str, Any]:
+    """Decode the upstream tool-call argument string into a JSON object."""
     try:
         data = json.loads(raw or "{}")
     except json.JSONDecodeError as exc:
@@ -284,12 +351,14 @@ def _parse_arguments(raw: str) -> dict[str, Any]:
 
 
 def _schema_for(tool: ResponseTool) -> dict[str, Any]:
+    """Return the effective schema object for a function tool."""
     if tool.function:
         return tool.function.parameters
     return tool.parameters or {}
 
 
 def _coerce_primitive(value: Any, schema: dict[str, Any]) -> tuple[Any, bool]:
+    """Apply a few conservative primitive coercions before schema validation."""
     expected = schema.get("type")
     if expected == "string":
         if isinstance(value, str):
@@ -317,11 +386,23 @@ def _coerce_primitive(value: Any, schema: dict[str, Any]) -> tuple[Any, bool]:
     return value, False
 
 
-def _resolve_property_name(argument_name: str, properties: dict[str, Any]) -> str | None:
+def _resolve_property_name(
+    argument_name: str, properties: dict[str, Any]
+) -> str | None:
+    """Match a model-supplied argument name to the canonical schema property.
+
+    We try exact matches first, then normalization, a small alias table, and
+    finally close matches so common punctuation or naming drift can be repaired
+    without guessing across unrelated fields.
+    """
     if argument_name in properties:
         return argument_name
 
-    normalized_matches = [name for name in properties if _normalize_name(name) == _normalize_name(argument_name)]
+    normalized_matches = [
+        name
+        for name in properties
+        if _normalize_name(name) == _normalize_name(argument_name)
+    ]
     if len(normalized_matches) == 1:
         return normalized_matches[0]
 
@@ -330,14 +411,24 @@ def _resolve_property_name(argument_name: str, properties: dict[str, Any]) -> st
         if canonical_name in properties and lowered in aliases:
             return canonical_name
 
-    close = difflib.get_close_matches(argument_name, list(properties.keys()), n=1, cutoff=0.8)
+    close = difflib.get_close_matches(
+        argument_name, list(properties.keys()), n=1, cutoff=0.8
+    )
     if len(close) == 1:
         return close[0]
 
     return None
 
 
-def _repair_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _repair_arguments(
+    arguments: dict[str, Any], schema: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Rewrite raw tool arguments into the advertised schema shape.
+
+    The repair pass keeps only schema-known fields, renames close matches,
+    performs narrow primitive coercions, and then fails fast if required fields
+    are still missing after the cleanup.
+    """
     properties = schema.get("properties", {})
     required = set(schema.get("required", []))
     cleaned: dict[str, Any] = {}
@@ -353,7 +444,12 @@ def _repair_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> tupl
         coerced, changed = _coerce_primitive(value, property_schema)
         cleaned[property_name] = coerced
         if changed:
-            coercions.append({"field": property_name, "target_type": str(property_schema.get("type"))})
+            coercions.append(
+                {
+                    "field": property_name,
+                    "target_type": str(property_schema.get("type")),
+                }
+            )
 
     missing = sorted(required - cleaned.keys())
     if missing:
@@ -379,27 +475,42 @@ def _repair_arguments(arguments: dict[str, Any], schema: dict[str, Any]) -> tupl
     }
 
 
-def _candidate_tool_names(tool_name: str, registry: dict[str, ResponseTool]) -> list[str]:
+def _candidate_tool_names(
+    tool_name: str, registry: dict[str, ResponseTool]
+) -> list[str]:
+    """Produce the ordered list of plausible canonical tool names for a call."""
     exact = [name for name in registry if name == tool_name]
     if exact:
         return exact
 
-    normalized_matches = [name for name in registry if _normalize_name(name) == _normalize_name(tool_name)]
+    normalized_matches = [
+        name for name in registry if _normalize_name(name) == _normalize_name(tool_name)
+    ]
     if normalized_matches:
         return normalized_matches
 
-    close = difflib.get_close_matches(tool_name, list(registry.keys()), n=2, cutoff=0.75)
+    close = difflib.get_close_matches(
+        tool_name, list(registry.keys()), n=2, cutoff=0.75
+    )
     if close:
         return close
 
     normalized = _normalize_name(tool_name)
-    return [name for name in registry if normalized and normalized in _normalize_name(name)]
+    return [
+        name for name in registry if normalized and normalized in _normalize_name(name)
+    ]
 
 
 def validate_and_rewrite_tool_calls(
     tool_calls: list[ChatToolCall] | None,
     tools: list[ResponseTool] | None,
 ) -> ToolCallValidationResult:
+    """Validate upstream tool calls against the advertised Responses tool list.
+
+    Each proposed tool call is matched to a canonical tool name, its arguments
+    are parsed and repaired against the JSON schema, and the final diagnostics
+    summarize whether we rewrote names, coerced values, or dropped extras.
+    """
     if not tool_calls:
         return ToolCallValidationResult(
             validated=[],
@@ -468,7 +579,10 @@ def validate_and_rewrite_tool_calls(
         rewritten_call.function.name = canonical_name
         rewritten_call.function.arguments = json.dumps(repaired, separators=(",", ":"))
 
-        rewritten = canonical_name != tool_call.function.name or rewritten_call.function.arguments != tool_call.function.arguments
+        rewritten = (
+            canonical_name != tool_call.function.name
+            or rewritten_call.function.arguments != tool_call.function.arguments
+        )
         if canonical_name != tool_call.function.name:
             rewritten_names += 1
         total_coercions += len(repair_diagnostics["coercions"])
@@ -511,6 +625,7 @@ def validate_and_rewrite_tool_calls(
 
 
 def summarize_request_ignored_fields(payload: object) -> dict[str, Any] | None:
+    """Report which known-but-ignored request fields were present on input."""
     if not isinstance(payload, dict):
         return None
 

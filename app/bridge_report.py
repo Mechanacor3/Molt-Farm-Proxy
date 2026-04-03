@@ -6,10 +6,16 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from app.devloop import load_active_run, request_log_path, resolve_log_dir, runs_log_path
+from app.devloop import (
+    load_active_run,
+    request_log_path,
+    resolve_log_dir,
+    runs_log_path,
+)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """Read a JSONL file defensively, skipping blank or malformed lines."""
     if not path.exists():
         return []
     records: list[dict[str, Any]] = []
@@ -24,6 +30,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _sum_numeric(records: list[dict[str, Any]], key: str) -> int:
+    """Sum the integer values for one key across the provided records."""
     total = 0
     for record in records:
         value = record.get(key)
@@ -33,6 +40,7 @@ def _sum_numeric(records: list[dict[str, Any]], key: str) -> int:
 
 
 def main() -> None:
+    """Print a compact summary of recent bridge runs and their proxy outcomes."""
     parser = argparse.ArgumentParser(description="Summarize recent codex-bridge runs.")
     parser.add_argument("--log-dir", default=None)
     parser.add_argument("--limit", type=int, default=5)
@@ -62,9 +70,21 @@ def main() -> None:
             record["failure_class"] for record in related if record.get("failure_class")
         )
         request_count = len(related)
-        statuses = Counter(str(record.get("status_code")) for record in related if record.get("status_code") is not None)
-        request_kinds = Counter(str(record.get("request_kind")) for record in related if record.get("request_kind"))
-        failure_details = Counter(str(record.get("failure_detail")) for record in related if record.get("failure_detail"))
+        statuses = Counter(
+            str(record.get("status_code"))
+            for record in related
+            if record.get("status_code") is not None
+        )
+        request_kinds = Counter(
+            str(record.get("request_kind"))
+            for record in related
+            if record.get("request_kind")
+        )
+        failure_details = Counter(
+            str(record.get("failure_detail"))
+            for record in related
+            if record.get("failure_detail")
+        )
         tool_dispositions = Counter()
         for record in related:
             tool_diagnostics = record.get("tool_diagnostics")
@@ -77,7 +97,11 @@ def main() -> None:
                 if isinstance(value, int):
                     tool_dispositions[key] += value
         note = ""
-        if request_count and request_kinds.get("responses_http", 0) == 0 and request_kinds.get("responses_websocket", 0) == 0:
+        if (
+            request_count
+            and request_kinds.get("responses_http", 0) == 0
+            and request_kinds.get("responses_websocket", 0) == 0
+        ):
             note = " note=no_http_post_seen"
         print(
             f"{run_id} {run['status']} exit={run['exit_code']} "

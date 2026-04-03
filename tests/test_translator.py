@@ -3,12 +3,23 @@ from __future__ import annotations
 from app.schemas_chat import ChatCompletionsResponse
 from app.schemas_responses import ResponsesRequest
 from app.settings import Settings
-from app.translator import build_tool_compatibility, translate_chat_response_to_responses, translate_responses_request_to_chat
+from app.translator import (
+    build_tool_compatibility,
+    translate_chat_response_to_responses,
+    translate_responses_request_to_chat,
+)
 
 
 def test_message_only_request_translates_to_chat() -> None:
-    request = ResponsesRequest(model="alias-model", input=[{"type": "message", "role": "user", "content": "hello"}])
-    settings = Settings(default_model="nemotron-3-nano:4b", model_aliases_json='{"alias-model":"real-model"}')
+    """A simple user message should translate into one chat user message."""
+    request = ResponsesRequest(
+        model="alias-model",
+        input=[{"type": "message", "role": "user", "content": "hello"}],
+    )
+    settings = Settings(
+        default_model="nemotron-3-nano:4b",
+        model_aliases_json='{"alias-model":"real-model"}',
+    )
     translated = translate_responses_request_to_chat(request, settings)
     assert translated.model == "real-model"
     assert translated.messages[0].role == "user"
@@ -17,12 +28,25 @@ def test_message_only_request_translates_to_chat() -> None:
 
 
 def test_reasoning_and_tool_result_translate_to_chat() -> None:
+    """Reasoning and tool-result items should map onto the expected chat roles."""
     request = ResponsesRequest(
         input=[
-            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Think carefully"}]},
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Think carefully"}],
+            },
             {"type": "message", "role": "user", "content": "Weather?"},
-            {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": '{"city":"Boston"}'},
-            {"type": "function_call_output", "call_id": "call_1", "output": {"temp_f": 70}},
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": '{"city":"Boston"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": {"temp_f": 70},
+            },
         ],
         tools=[
             {
@@ -48,6 +72,7 @@ def test_reasoning_and_tool_result_translate_to_chat() -> None:
 
 
 def test_tool_list_translates_for_ollama_and_ignores_disabled_web_search() -> None:
+    """Forwardable function tools should survive translation while disabled web search is ignored."""
     request = ResponsesRequest(
         input="tool?",
         tool_choice="auto",
@@ -85,12 +110,16 @@ def test_tool_list_translates_for_ollama_and_ignores_disabled_web_search() -> No
 
     assert translated.tool_choice == "auto"
     assert translated.tools is not None
-    assert [tool.function.name for tool in translated.tools] == ["read_file", "exec_command"]
+    assert [tool.function.name for tool in translated.tools] == [
+        "read_file",
+        "exec_command",
+    ]
     assert translated.tools[0].function.parameters["required"] == ["path"]
     assert translated.tools[1].function.parameters["required"] == ["cmd"]
 
 
 def test_mixed_tools_forward_only_function_tools() -> None:
+    """Mixed tool lists should forward only the function tools and log the rest."""
     request = ResponsesRequest(
         input="tool?",
         tools=[
@@ -115,25 +144,39 @@ def test_mixed_tools_forward_only_function_tools() -> None:
             },
         ],
     )
-    compatibility = build_tool_compatibility(request.tools, Settings(), require_forwardable=True)
+    compatibility = build_tool_compatibility(
+        request.tools, Settings(), require_forwardable=True
+    )
     translated = translate_responses_request_to_chat(request, Settings(), compatibility)
     assert translated.tools is not None
     assert [tool.function.name for tool in translated.tools] == ["read_file"]
-    assert compatibility.as_log_payload()["counts"]["hosted_tool_observed_not_executed"] == 1
+    assert (
+        compatibility.as_log_payload()["counts"]["hosted_tool_observed_not_executed"]
+        == 1
+    )
 
 
 def test_only_hosted_tools_are_classified_and_not_forwarded() -> None:
+    """Hosted tools alone should be classified without producing forwarded tools."""
     compatibility = build_tool_compatibility(
-        ResponsesRequest(input="tool?", tools=[{"type": "http", "name": "fetch_docs"}]).tools,
+        ResponsesRequest(
+            input="tool?", tools=[{"type": "http", "name": "fetch_docs"}]
+        ).tools,
         Settings(),
     )
     assert compatibility.forwarded_tools == []
-    assert compatibility.as_log_payload()["counts"]["hosted_tool_observed_not_executed"] == 1
+    assert (
+        compatibility.as_log_payload()["counts"]["hosted_tool_observed_not_executed"]
+        == 1
+    )
 
 
 def test_only_disabled_web_search_tools_are_classified_and_not_forwarded() -> None:
+    """Disabled web-search tools alone should be ignored without forwarding."""
     compatibility = build_tool_compatibility(
-        ResponsesRequest(input="tool?", tools=[{"type": "web_search", "external_web_access": False}]).tools,
+        ResponsesRequest(
+            input="tool?", tools=[{"type": "web_search", "external_web_access": False}]
+        ).tools,
         Settings(),
     )
     assert compatibility.forwarded_tools == []
@@ -141,6 +184,7 @@ def test_only_disabled_web_search_tools_are_classified_and_not_forwarded() -> No
 
 
 def test_debug_tool_name_filter_keeps_only_named_tool() -> None:
+    """The debug allowlist should keep only the explicitly named tool."""
     request = ResponsesRequest(
         input="tool?",
         tools=[
@@ -175,6 +219,7 @@ def test_debug_tool_name_filter_keeps_only_named_tool() -> None:
 
 
 def test_chat_text_response_translates_to_responses() -> None:
+    """Plain chat text should come back as a Responses assistant message."""
     request = ResponsesRequest(input="hi")
     chat_response = ChatCompletionsResponse.model_validate(
         {
@@ -192,7 +237,9 @@ def test_chat_text_response_translates_to_responses() -> None:
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }
     )
-    translated, validation = translate_chat_response_to_responses(request, chat_response)
+    translated, validation = translate_chat_response_to_responses(
+        request, chat_response
+    )
     assert translated.object == "response"
     assert translated.output[0].type == "message"
     assert translated.output[0].content[0]["text"] == "hello"
@@ -201,6 +248,7 @@ def test_chat_text_response_translates_to_responses() -> None:
 
 
 def test_chat_tool_call_translates_to_responses() -> None:
+    """Native chat tool calls should translate into Responses function_call items."""
     request = ResponsesRequest(
         input="tool?",
         tools=[
@@ -233,7 +281,10 @@ def test_chat_tool_call_translates_to_responses() -> None:
                             {
                                 "id": "call_1",
                                 "type": "function",
-                                "function": {"name": "get_weather", "arguments": '{"city":"Boston"}'},
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": '{"city":"Boston"}',
+                                },
                             }
                         ],
                     },
@@ -243,13 +294,16 @@ def test_chat_tool_call_translates_to_responses() -> None:
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
         }
     )
-    translated, validation = translate_chat_response_to_responses(request, chat_response)
+    translated, validation = translate_chat_response_to_responses(
+        request, chat_response
+    )
     assert translated.output[0].type == "function_call"
     assert translated.output[0].name == "get_weather"
     assert validation.diagnostics["validated"] == 1
 
 
 def test_chat_text_json_object_recovers_single_tool_call() -> None:
+    """JSON object text should be recovered as a single validated tool call."""
     request = ResponsesRequest(
         input="tool?",
         tools=[
@@ -286,7 +340,9 @@ def test_chat_text_json_object_recovers_single_tool_call() -> None:
         }
     )
 
-    translated, validation = translate_chat_response_to_responses(request, chat_response)
+    translated, validation = translate_chat_response_to_responses(
+        request, chat_response
+    )
 
     assert translated.output[0].type == "function_call"
     assert translated.output[0].name == "exec_command"
@@ -296,6 +352,7 @@ def test_chat_text_json_object_recovers_single_tool_call() -> None:
 
 
 def test_chat_text_json_array_recovers_named_tool_call() -> None:
+    """A two-item JSON array should recover a named tool call and arguments."""
     request = ResponsesRequest(
         input="tool?",
         tools=[
@@ -332,7 +389,9 @@ def test_chat_text_json_array_recovers_named_tool_call() -> None:
         }
     )
 
-    translated, validation = translate_chat_response_to_responses(request, chat_response)
+    translated, validation = translate_chat_response_to_responses(
+        request, chat_response
+    )
 
     assert translated.output[0].type == "function_call"
     assert translated.output[0].name == "exec_command"
@@ -341,6 +400,7 @@ def test_chat_text_json_array_recovers_named_tool_call() -> None:
 
 
 def test_chat_text_fenced_tool_name_and_input_recovers_tool_call() -> None:
+    """Fenced tool_name/tool_input JSON should recover to the canonical function call."""
     request = ResponsesRequest(
         input="tool?",
         tools=[
@@ -380,7 +440,9 @@ def test_chat_text_fenced_tool_name_and_input_recovers_tool_call() -> None:
         }
     )
 
-    translated, validation = translate_chat_response_to_responses(request, chat_response)
+    translated, validation = translate_chat_response_to_responses(
+        request, chat_response
+    )
 
     assert translated.output[0].type == "function_call"
     assert translated.output[0].name == "exec_command"

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ResponseContentPart(BaseModel):
@@ -45,9 +45,13 @@ class ResponseTool(BaseModel):
 
 class ResponseUsageDetails(BaseModel):
     input_tokens: int = 0
-    input_tokens_details: dict[str, Any] = Field(default_factory=lambda: {"cached_tokens": 0})
+    input_tokens_details: dict[str, Any] = Field(
+        default_factory=lambda: {"cached_tokens": 0}
+    )
     output_tokens: int = 0
-    output_tokens_details: dict[str, Any] = Field(default_factory=lambda: {"reasoning_tokens": 0})
+    output_tokens_details: dict[str, Any] = Field(
+        default_factory=lambda: {"reasoning_tokens": 0}
+    )
     total_tokens: int = 0
 
 
@@ -94,4 +98,5 @@ class ResponsesResponse(BaseModel):
 
     @staticmethod
     def now_iso() -> str:
+        """Return a Responses-compatible UTC timestamp for new proxy responses."""
         return datetime.now(timezone.utc).isoformat()
