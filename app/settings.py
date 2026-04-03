@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,10 +23,12 @@ class Settings(BaseSettings):
     @field_validator("ollama_base_url")
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:
+        """Normalize the Ollama base URL so request joins stay predictable."""
         return value.rstrip("/")
 
     @property
     def model_aliases(self) -> dict[str, str]:
+        """Decode and validate the configured model alias mapping."""
         try:
             data = json.loads(self.model_aliases_json)
         except json.JSONDecodeError as exc:
@@ -43,21 +44,27 @@ class Settings(BaseSettings):
 
     @property
     def resolved_log_dir(self) -> Path:
+        """Resolve the configured log directory into an absolute path."""
         return Path(self.log_dir).expanduser().resolve()
 
     def resolve_model(self, requested_model: str | None) -> str:
+        """Map a Codex-facing model name onto the concrete upstream model."""
         if not requested_model:
             return self.default_model
         return self.model_aliases.get(requested_model, requested_model)
 
     @property
     def debug_tool_name_set(self) -> set[str] | None:
+        """Parse the optional debug allowlist of function tool names."""
         if not self.debug_tool_names:
             return None
-        names = {item.strip() for item in self.debug_tool_names.split(",") if item.strip()}
+        names = {
+            item.strip() for item in self.debug_tool_names.split(",") if item.strip()
+        }
         return names or None
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Cache settings so the app and tests share one resolved configuration."""
     return Settings()

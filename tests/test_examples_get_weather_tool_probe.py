@@ -4,7 +4,9 @@ import importlib.util
 import json
 from pathlib import Path
 
-_MODULE_PATH = Path(__file__).resolve().parents[1] / "examples" / "get_weather_tool_probe.py"
+_MODULE_PATH = (
+    Path(__file__).resolve().parents[1] / "examples" / "get_weather_tool_probe.py"
+)
 _SPEC = importlib.util.spec_from_file_location("get_weather_tool_probe", _MODULE_PATH)
 assert _SPEC is not None
 assert _SPEC.loader is not None
@@ -16,15 +18,21 @@ responses_tool_output_value = _MODULE.responses_tool_output_value
 
 
 def test_responses_tool_output_value_stringifies_objects() -> None:
-    assert responses_tool_output_value({"temp_f": 61, "condition": "sunny"}) == '{"temp_f": 61, "condition": "sunny"}'
+    """Structured tool outputs should be stringified for the Responses follow-up turn."""
+    assert (
+        responses_tool_output_value({"temp_f": 61, "condition": "sunny"})
+        == '{"temp_f": 61, "condition": "sunny"}'
+    )
     assert responses_tool_output_value([1, 2, 3]) == "[1, 2, 3]"
 
 
 def test_responses_tool_output_value_preserves_strings() -> None:
+    """String tool outputs should pass through without re-encoding."""
     assert responses_tool_output_value('{"temp_f":61}') == '{"temp_f":61}'
 
 
 def test_build_responses_followup_input_uses_string_tool_output() -> None:
+    """Responses follow-up input should include stringified tool output content."""
     call = {
         "call_id": "call_123",
         "name": "get_weather",

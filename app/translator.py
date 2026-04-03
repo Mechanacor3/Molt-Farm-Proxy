@@ -9,7 +9,6 @@ from app.schemas_chat import (
     ChatCompletionsRequest,
     ChatCompletionsResponse,
     ChatMessage,
-    ChatTool,
     ChatToolCall,
     ChatToolFunctionCall,
 )
@@ -17,28 +16,31 @@ from app.schemas_responses import (
     ResponseContentPart,
     ResponseInputItem,
     ResponseOutputItem,
-    ResponseTool,
-    ResponseToolFunction,
-    ResponseUsageDetails,
     ResponsesRequest,
     ResponsesResponse,
+    ResponseTool,
+    ResponseUsageDetails,
 )
 from app.settings import Settings
 from app.tool_guard import (
-    ToolCompatibilityResult,
     ToolCallValidationResult,
+    ToolCompatibilityResult,
     classify_response_tools,
     validate_and_rewrite_tool_calls,
 )
 
 
 def _item_to_model(item: ResponseInputItem | dict[str, Any]) -> ResponseInputItem:
+    """Normalize mixed input entries into the shared pydantic model."""
     if isinstance(item, ResponseInputItem):
         return item
     return ResponseInputItem.model_validate(item)
 
 
-def _extract_text(content: str | list[ResponseContentPart | dict[str, Any]] | None) -> str:
+def _extract_text(
+    content: str | list[ResponseContentPart | dict[str, Any]] | None,
+) -> str:
+    """Collapse the flexible Responses content shape into plain text."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -55,6 +57,7 @@ def _extract_text(content: str | list[ResponseContentPart | dict[str, Any]] | No
 
 
 def _stringify_output(output: str | dict[str, Any] | list[Any] | None) -> str:
+    """Serialize tool output into the string form chat tool messages require."""
     if output is None:
         return ""
     if isinstance(output, str):
@@ -63,6 +66,7 @@ def _stringify_output(output: str | dict[str, Any] | list[Any] | None) -> str:
 
 
 def _strip_json_code_fence(content: str) -> str:
+    """Remove a surrounding fenced code block before JSON recovery."""
     stripped = content.strip()
     if not stripped.startswith("```"):
         return stripped
@@ -74,6 +78,7 @@ def _strip_json_code_fence(content: str) -> str:
 
 
 def _single_function_tool_name(tools: list[ResponseTool] | None) -> str | None:
+    """Return the lone function tool name when recovery has no explicit name."""
     names: list[str] = []
     for tool in tools or []:
         if tool.type != "function":
@@ -86,7 +91,10 @@ def _single_function_tool_name(tools: list[ResponseTool] | None) -> str | None:
     return None
 
 
-def _schema_for_tool_name(tool_name: str, tools: list[ResponseTool] | None) -> dict[str, Any] | None:
+def _schema_for_tool_name(
+    tool_name: str, tools: list[ResponseTool] | None
+) -> dict[str, Any] | None:
+    """Look up the advertised JSON schema for a named function tool."""
     for tool in tools or []:
         if tool.type != "function":
             continue
@@ -103,6 +111,11 @@ def _normalize_recovered_arguments(
     arguments: str | dict[str, Any] | list[Any] | None,
     tools: list[ResponseTool] | None,
 ) -> str | dict[str, Any] | list[Any] | None:
+    """Map loose recovered tool arguments back toward the advertised schema.
+
+    When the model emits plain strings or partially named objects, we try a few
+    narrow heuristics so obvious single-argument tool calls still validate.
+    """
     if not isinstance(arguments, str):
         return arguments
 
@@ -131,6 +144,12 @@ def _recover_tool_calls_from_message_content(
     content: str | None,
     tools: list[ResponseTool] | None,
 ) -> list[ChatToolCall] | None:
+    """Recover a tool call from assistant text that looks like JSON.
+
+    Ollama sometimes returns textual JSON instead of a native tool-call field,
+    so this helper looks for a few observed shapes and wraps the recovered call
+    back into the chat tool-call structure used downstream.
+    """
     if not content:
         return None
 
@@ -157,7 +176,9 @@ def _recover_tool_calls_from_message_content(
                 tool_name = maybe_name
                 arguments = function.get("arguments")
         if tool_name is None:
-            maybe_name = parsed.get("name") or parsed.get("tool") or parsed.get("tool_name")
+            maybe_name = (
+                parsed.get("name") or parsed.get("tool") or parsed.get("tool_name")
+            )
             if isinstance(maybe_name, str):
                 tool_name = maybe_name
                 arguments = (
@@ -196,6 +217,7 @@ def build_tool_compatibility(
     *,
     require_forwardable: bool = False,
 ) -> ToolCompatibilityResult:
+    """Classify and filter Responses tools using the current debug settings."""
     return classify_response_tools(
         tools,
         allowed_function_names=settings.debug_tool_name_set,
@@ -208,6 +230,12 @@ def translate_responses_request_to_chat(
     settings: Settings,
     compatibility: ToolCompatibilityResult | None = None,
 ) -> ChatCompletionsRequest:
+    """Translate a Responses request into the narrower Ollama chat shape.
+
+    The translation preserves role ordering, folds developer messages into chat
+    system messages, threads prior tool results through chat tool messages, and
+    forwards only the subset of tools that can safely survive chat completions.
+    """
     messages: list[ChatMessage] = []
     hidden_reasoning: list[str] = []
 
@@ -223,16 +251,26 @@ def translate_responses_request_to_chat(
                 role = item.role or "user"
                 if role == "developer":
                     role = "system"
-                messages.append(ChatMessage(role=role, content=_extract_text(item.content)))
+                messages.append(
+                    ChatMessage(role=role, content=_extract_text(item.content))
+                )
             elif item.type == "reasoning":
                 if item.summary:
-                    snippets = [entry.get("text", "") for entry in item.summary if isinstance(entry, dict)]
+                    snippets = [
+                        entry.get("text", "")
+                        for entry in item.summary
+                        if isinstance(entry, dict)
+                    ]
                     hidden_reasoning.extend(filter(None, snippets))
                 else:
                     hidden_reasoning.append(_extract_text(item.content))
             elif item.type == "function_call":
                 if not item.name or not item.call_id:
-                    raise ProxyError(400, "invalid_input", "Function call items must include 'name' and 'call_id'.")
+                    raise ProxyError(
+                        400,
+                        "invalid_input",
+                        "Function call items must include 'name' and 'call_id'.",
+                    )
                 arguments = item.arguments
                 if isinstance(arguments, dict):
                     arguments = json.dumps(arguments, separators=(",", ":"))
@@ -246,14 +284,20 @@ def translate_responses_request_to_chat(
                             ChatToolCall(
                                 id=item.call_id,
                                 type="function",
-                                function=ChatToolFunctionCall(name=item.name, arguments=arguments),
+                                function=ChatToolFunctionCall(
+                                    name=item.name, arguments=arguments
+                                ),
                             )
                         ],
                     )
                 )
             elif item.type == "function_call_output":
                 if not item.call_id:
-                    raise ProxyError(400, "invalid_input", "Function call output items must include 'call_id'.")
+                    raise ProxyError(
+                        400,
+                        "invalid_input",
+                        "Function call output items must include 'call_id'.",
+                    )
                 messages.append(
                     ChatMessage(
                         role="tool",
@@ -269,11 +313,17 @@ def translate_responses_request_to_chat(
                 )
 
     if hidden_reasoning:
-        reasoning_prefix = "Prior reasoning context:\n" + "\n".join(filter(None, hidden_reasoning))
+        reasoning_prefix = "Prior reasoning context:\n" + "\n".join(
+            filter(None, hidden_reasoning)
+        )
         messages.insert(0, ChatMessage(role="system", content=reasoning_prefix))
 
     if not messages:
-        raise ProxyError(400, "invalid_input", "Responses requests must include at least one input item.")
+        raise ProxyError(
+            400,
+            "invalid_input",
+            "Responses requests must include at least one input item.",
+        )
 
     model = settings.resolve_model(request.model)
     max_tokens = request.max_output_tokens
@@ -282,7 +332,9 @@ def translate_responses_request_to_chat(
         model=model,
         messages=messages,
         stream=False,
-        tools=compatibility.forwarded_tools or None if compatibility is not None else build_tool_compatibility(request.tools, settings).forwarded_tools or None,
+        tools=compatibility.forwarded_tools or None
+        if compatibility is not None
+        else build_tool_compatibility(request.tools, settings).forwarded_tools or None,
         tool_choice=request.tool_choice,
         temperature=request.temperature,
         top_p=request.top_p,
@@ -292,6 +344,7 @@ def translate_responses_request_to_chat(
 
 
 def _usage_from_chat(chat_response: ChatCompletionsResponse) -> ResponseUsageDetails:
+    """Map chat token accounting into the Responses usage schema."""
     usage = chat_response.usage
     if usage is None:
         return ResponseUsageDetails()
@@ -306,8 +359,16 @@ def translate_chat_response_to_responses(
     request: ResponsesRequest,
     chat_response: ChatCompletionsResponse,
 ) -> tuple[ResponsesResponse, ToolCallValidationResult]:
+    """Translate one Ollama chat response back into a Responses payload.
+
+    We prefer native tool calls when present, fall back to textual JSON
+    recovery when needed, and always run the result through the tool guard so
+    malformed upstream tool selections are surfaced consistently.
+    """
     if not chat_response.choices:
-        raise ProxyError(502, "invalid_upstream_payload", "Ollama returned no completion choices.")
+        raise ProxyError(
+            502, "invalid_upstream_payload", "Ollama returned no completion choices."
+        )
 
     choice = chat_response.choices[0]
     message = choice.message
@@ -324,10 +385,14 @@ def translate_chat_response_to_responses(
 
     recovered_tool_calls = None
     if not message.tool_calls:
-        recovered_tool_calls = _recover_tool_calls_from_message_content(message.content, request.tools)
+        recovered_tool_calls = _recover_tool_calls_from_message_content(
+            message.content, request.tools
+        )
 
     if message.tool_calls or recovered_tool_calls:
-        validation = validate_and_rewrite_tool_calls(message.tool_calls or recovered_tool_calls, request.tools)
+        validation = validate_and_rewrite_tool_calls(
+            message.tool_calls or recovered_tool_calls, request.tools
+        )
         for validated in validation.validated:
             output.append(
                 ResponseOutputItem(
@@ -380,22 +445,41 @@ def translate_chat_response_to_responses(
 
 
 def build_response_events(response: ResponsesResponse) -> list[dict[str, Any]]:
+    """Build the typed websocket event sequence expected by Codex clients."""
     payload = response.model_dump(mode="json")
     created_payload = dict(payload)
     created_payload["status"] = "in_progress"
     return [
         {"type": "response.created", "sequence_number": 0, "response": created_payload},
-        {"type": "response.in_progress", "sequence_number": 1, "response": created_payload},
-        {"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": payload["output"][0]}
+        {
+            "type": "response.in_progress",
+            "sequence_number": 1,
+            "response": created_payload,
+        },
+        {
+            "type": "response.output_item.added",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": payload["output"][0],
+        }
         if payload.get("output")
-        else {"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": None},
+        else {
+            "type": "response.output_item.added",
+            "sequence_number": 2,
+            "output_index": 0,
+            "item": None,
+        },
         {"type": "response.completed", "sequence_number": 3, "response": payload},
     ]
 
 
 def build_sse_events(response: ResponsesResponse) -> list[str]:
-    return [_format_sse(event) for event in build_response_events(response)] + ["data: [DONE]\n\n"]
+    """Serialize the typed Responses event sequence into SSE frames."""
+    return [_format_sse(event) for event in build_response_events(response)] + [
+        "data: [DONE]\n\n"
+    ]
 
 
 def _format_sse(payload: dict[str, Any]) -> str:
+    """Render one SSE `data:` frame with compact JSON payload encoding."""
     return f"data: {json.dumps(payload, separators=(',', ':'))}\n\n"

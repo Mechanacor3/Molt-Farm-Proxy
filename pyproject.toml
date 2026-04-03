@@ -28,7 +28,11 @@ molt-proxy-dev = "app.proxy_dev:main"
 dev = [
   "pytest>=8.3,<9.0",
   "pytest-asyncio>=0.24,<1.0",
+  "ruff>=0.6,<1.0",
 ]
+
+[tool.ruff]
+line-length = 88
 
 [tool.setuptools.packages.find]
 include = ["app*"]

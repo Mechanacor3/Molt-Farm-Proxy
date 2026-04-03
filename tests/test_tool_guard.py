@@ -3,10 +3,15 @@ from __future__ import annotations
 from app.errors import ProxyError
 from app.schemas_chat import ChatToolCall, ChatToolFunctionCall
 from app.schemas_responses import ResponseTool, ResponseToolFunction
-from app.tool_guard import classify_response_tools, validate_and_rewrite_tool_calls, validate_response_tools
+from app.tool_guard import (
+    classify_response_tools,
+    validate_and_rewrite_tool_calls,
+    validate_response_tools,
+)
 
 
 def _tool() -> ResponseTool:
+    """Build a representative weather tool schema for guard tests."""
     return ResponseTool(
         type="function",
         function=ResponseToolFunction(
@@ -24,6 +29,7 @@ def _tool() -> ResponseTool:
 
 
 def _exec_tool() -> ResponseTool:
+    """Build a representative exec_command tool schema for alias tests."""
     return ResponseTool(
         type="function",
         function=ResponseToolFunction(
@@ -41,11 +47,14 @@ def _exec_tool() -> ResponseTool:
 
 
 def test_exact_tool_match_passes() -> None:
+    """Exact tool names should validate without rewrites."""
     calls = [
         ChatToolCall(
             id="call_1",
             type="function",
-            function=ChatToolFunctionCall(name="get_weather", arguments='{"city":"Boston"}'),
+            function=ChatToolFunctionCall(
+                name="get_weather", arguments='{"city":"Boston"}'
+            ),
         )
     ]
     result = validate_and_rewrite_tool_calls(calls, [_tool()])
@@ -55,11 +64,14 @@ def test_exact_tool_match_passes() -> None:
 
 
 def test_near_match_rewrites_name() -> None:
+    """Near-miss tool names should be rewritten to the canonical schema name."""
     calls = [
         ChatToolCall(
             id="call_1",
             type="function",
-            function=ChatToolFunctionCall(name="get-weather", arguments='{"city":"Boston"}'),
+            function=ChatToolFunctionCall(
+                name="get-weather", arguments='{"city":"Boston"}'
+            ),
         )
     ]
     result = validate_and_rewrite_tool_calls(calls, [_tool()])
@@ -69,6 +81,7 @@ def test_near_match_rewrites_name() -> None:
 
 
 def test_invalid_json_fails() -> None:
+    """Non-JSON argument strings should fail with invalid_tool_call."""
     calls = [
         ChatToolCall(
             id="call_1",
@@ -85,6 +98,7 @@ def test_invalid_json_fails() -> None:
 
 
 def test_missing_required_argument_fails() -> None:
+    """Missing required schema fields should fail validation."""
     calls = [
         ChatToolCall(
             id="call_1",
@@ -101,11 +115,14 @@ def test_missing_required_argument_fails() -> None:
 
 
 def test_coercions_and_extra_fields_are_tracked() -> None:
+    """Coercions and dropped fields should be reflected in the diagnostics."""
     calls = [
         ChatToolCall(
             id="call_1",
             type="function",
-            function=ChatToolFunctionCall(name="get_weather", arguments='{"city":7,"days":"2","extra":"ignored"}'),
+            function=ChatToolFunctionCall(
+                name="get_weather", arguments='{"city":7,"days":"2","extra":"ignored"}'
+            ),
         )
     ]
     result = validate_and_rewrite_tool_calls(calls, [_tool()])
@@ -115,6 +132,7 @@ def test_coercions_and_extra_fields_are_tracked() -> None:
 
 
 def test_common_argument_aliases_are_rewritten() -> None:
+    """Known argument aliases like command -> cmd should be repaired automatically."""
     calls = [
         ChatToolCall(
             id="call_1",
@@ -126,11 +144,15 @@ def test_common_argument_aliases_are_rewritten() -> None:
         )
     ]
     result = validate_and_rewrite_tool_calls(calls, [_exec_tool()])
-    assert result.validated[0].tool_call.function.arguments == '{"cmd":"pwd","workdir":"/tmp"}'
+    assert (
+        result.validated[0].tool_call.function.arguments
+        == '{"cmd":"pwd","workdir":"/tmp"}'
+    )
     assert result.diagnostics["dropped_extra_fields"] == 1
 
 
 def test_disabled_web_search_tool_is_ignored() -> None:
+    """Disabled web-search tools should be ignored while function tools remain usable."""
     registry = validate_response_tools(
         [
             ResponseTool(type="web_search", external_web_access=False),
@@ -138,7 +160,10 @@ def test_disabled_web_search_tool_is_ignored() -> None:
                 type="function",
                 function=ResponseToolFunction(
                     name="exec_command",
-                    parameters={"type": "object", "properties": {"cmd": {"type": "string"}}},
+                    parameters={
+                        "type": "object",
+                        "properties": {"cmd": {"type": "string"}},
+                    },
                 ),
             ),
         ]
@@ -147,8 +172,11 @@ def test_disabled_web_search_tool_is_ignored() -> None:
 
 
 def test_external_web_search_tool_is_rejected() -> None:
+    """External web-search tools should be rejected as unsupported."""
     try:
-        validate_response_tools([ResponseTool(type="web_search", external_web_access=True)])
+        validate_response_tools(
+            [ResponseTool(type="web_search", external_web_access=True)]
+        )
     except ProxyError as exc:
         assert exc.code == "unsupported_tool"
     else:  # pragma: no cover
@@ -156,14 +184,18 @@ def test_external_web_search_tool_is_rejected() -> None:
 
 
 def test_hosted_tool_is_classified_without_execution() -> None:
+    """Hosted tool types should be classified without being forwarded or executed."""
     result = classify_response_tools([ResponseTool(type="http", name="fetch_docs")])
     assert result.forwarded_tools == []
     assert result.as_log_payload()["counts"]["hosted_tool_observed_not_executed"] == 1
 
 
 def test_only_non_forwardable_tools_fail_with_specific_error() -> None:
+    """Requests with no forwardable tools should use the policy-specific error code."""
     try:
-        classify_response_tools([ResponseTool(type="http", name="fetch_docs")], require_forwardable=True)
+        classify_response_tools(
+            [ResponseTool(type="http", name="fetch_docs")], require_forwardable=True
+        )
     except ProxyError as exc:
         assert exc.code == "no_forwardable_tools"
         assert exc.details["failure_detail"] == "tool_definition_policy_error"

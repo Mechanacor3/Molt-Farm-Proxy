@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import httpx
 
-_MODULE_PATH = Path(__file__).resolve().parents[1] / "examples" / "exec_command_capability_probe.py"
-_SPEC = importlib.util.spec_from_file_location("exec_command_capability_probe", _MODULE_PATH)
+_MODULE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "examples"
+    / "exec_command_capability_probe.py"
+)
+_SPEC = importlib.util.spec_from_file_location(
+    "exec_command_capability_probe", _MODULE_PATH
+)
 assert _SPEC is not None
 assert _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
@@ -25,6 +31,7 @@ summarize_flags = _MODULE.summarize_flags
 
 
 def test_build_tool_presets_keep_variants_intentional() -> None:
+    """Tool presets should preserve the intentionally different schema variants."""
     presets = build_tool_presets()
 
     assert list(presets["narrow"]["parameters"]["properties"]) == ["cmd"]
@@ -49,13 +56,16 @@ def test_build_tool_presets_keep_variants_intentional() -> None:
         "yield_time_ms",
     }
 
-    presets["observed_full"]["parameters"]["properties"]["cmd"]["description"] = "changed"
-    assert build_tool_presets()["observed_full"]["parameters"]["properties"]["cmd"]["description"] == (
-        "Shell command to execute."
+    presets["observed_full"]["parameters"]["properties"]["cmd"]["description"] = (
+        "changed"
     )
+    assert build_tool_presets()["observed_full"]["parameters"]["properties"]["cmd"][
+        "description"
+    ] == ("Shell command to execute.")
 
 
 def test_build_case_matrix_is_stable() -> None:
+    """The probe case matrix should stay in a stable, expected order."""
     assert [case.name for case in build_case_matrix()] == [
         "pwd_narrow_plain",
         "pwd_narrow_strict",
@@ -69,9 +79,13 @@ def test_build_case_matrix_is_stable() -> None:
 
 
 def test_extract_responses_function_call_normalizes_fields() -> None:
+    """Responses function-call extraction should normalize the observed field names."""
     payload = {
         "output": [
-            {"type": "message", "content": [{"type": "output_text", "text": "no tool"}]},
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "no tool"}],
+            },
             {
                 "type": "function_call",
                 "call_id": "call_123",
@@ -89,6 +103,7 @@ def test_extract_responses_function_call_normalizes_fields() -> None:
 
 
 def test_extract_chat_function_call_normalizes_fields() -> None:
+    """Chat function-call extraction should normalize the observed field names."""
     payload = {
         "choices": [
             {
@@ -116,6 +131,7 @@ def test_extract_chat_function_call_normalizes_fields() -> None:
 
 
 def test_summarize_flags_detects_strict_help_and_followup_success() -> None:
+    """Capability flags should recognize strict-prompt improvements and follow-up success."""
     results = [
         {
             "surface": "chat",
@@ -162,6 +178,7 @@ def test_summarize_flags_detects_strict_help_and_followup_success() -> None:
 
 
 def test_summarize_flags_limits_full_schema_and_file_read_flags() -> None:
+    """Capability flags should stay false when only the minimal cases pass."""
     results = [
         {
             "surface": "chat",
@@ -192,30 +209,45 @@ def test_summarize_flags_limits_full_schema_and_file_read_flags() -> None:
 
 
 def test_build_surface_unavailable_results_marks_all_cases_failed() -> None:
+    """Surface preflight failures should mark every requested case as failed."""
     cases = build_case_matrix()[:2]
 
-    results = build_surface_unavailable_results("responses", cases, "surface_preflight_failed: timed out")
+    results = build_surface_unavailable_results(
+        "responses", cases, "surface_preflight_failed: timed out"
+    )
 
-    assert [item["case_name"] for item in results] == ["pwd_narrow_plain", "pwd_narrow_strict"]
+    assert [item["case_name"] for item in results] == [
+        "pwd_narrow_plain",
+        "pwd_narrow_strict",
+    ]
     assert all(item["surface"] == "responses" for item in results)
     assert all(item["case_success"] is False for item in results)
-    assert all(item["error"] == "surface_preflight_failed: timed out" for item in results)
+    assert all(
+        item["error"] == "surface_preflight_failed: timed out" for item in results
+    )
 
 
 def test_preflight_surface_accepts_expected_proxy_probe() -> None:
-    transport = httpx.MockTransport(lambda request: httpx.Response(405, request=request))
+    """Responses preflight should accept the proxy's expected 405 probe response."""
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(405, request=request)
+    )
     with httpx.Client(transport=transport) as client:
         assert preflight_surface(client, "responses", "http://proxy.test") is None
 
 
 def test_preflight_surface_reports_bad_status_and_timeouts() -> None:
-    bad_status_transport = httpx.MockTransport(lambda request: httpx.Response(200, request=request))
+    """Responses preflight should report unexpected status codes and timeouts clearly."""
+    bad_status_transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, request=request)
+    )
     with httpx.Client(transport=bad_status_transport) as client:
         assert preflight_surface(client, "responses", "http://proxy.test") == (
             "surface_preflight_failed: expected 405 from GET /v1/responses, got 200"
         )
 
     def raise_timeout(request: httpx.Request) -> httpx.Response:
+        """Simulate a surface preflight timeout from the underlying client."""
         raise httpx.ReadTimeout("boom", request=request)
 
     timeout_transport = httpx.MockTransport(raise_timeout)

@@ -23,32 +23,41 @@ DEFAULT_ALIAS_MAP = {
 
 
 def resolve_codex_binary(explicit: str | None = None) -> str:
-    candidate = explicit or os.environ.get("CODEX_BRIDGE_BINARY") or DEFAULT_CODEX_BINARY
+    """Resolve the Codex binary path from explicit input, env, or defaults."""
+    candidate = (
+        explicit or os.environ.get("CODEX_BRIDGE_BINARY") or DEFAULT_CODEX_BINARY
+    )
     return str(Path(candidate).expanduser())
 
 
 def resolve_log_dir(explicit: str | None = None) -> Path:
+    """Resolve the log directory path from explicit input, env, or defaults."""
     raw = explicit or os.environ.get("CODEX_BRIDGE_LOG_DIR") or DEFAULT_LOG_DIR
     return Path(raw).expanduser().resolve()
 
 
 def generate_run_id(explicit: str | None = None) -> str:
+    """Return a stable bridge run id, generating one when none was supplied."""
     return explicit or f"bridge-{uuid4().hex[:12]}"
 
 
 def state_file(log_dir: Path) -> Path:
+    """Return the active-run state file path for the selected log directory."""
     return log_dir / "active-run.json"
 
 
 def runs_log_path(log_dir: Path) -> Path:
+    """Return the bridge run-events log path."""
     return log_dir / "bridge-runs.jsonl"
 
 
 def request_log_path(log_dir: Path) -> Path:
+    """Return the proxy request log path correlated to bridge runs."""
     return log_dir / "proxy-requests.jsonl"
 
 
 def load_active_run(log_dir: Path) -> dict[str, Any] | None:
+    """Load the active bridge run snapshot if it exists and is valid JSON."""
     path = state_file(log_dir)
     if not path.exists():
         return None
@@ -59,19 +68,24 @@ def load_active_run(log_dir: Path) -> dict[str, Any] | None:
 
 
 def write_active_run(log_dir: Path, payload: dict[str, Any]) -> None:
+    """Persist the active bridge run snapshot for proxy-side correlation."""
     path = state_file(log_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
 
 
 def clear_active_run(log_dir: Path, run_id: str) -> None:
+    """Delete the active-run snapshot only if it still belongs to this run."""
     path = state_file(log_dir)
     current = load_active_run(log_dir)
     if current and current.get("run_id") == run_id and path.exists():
         path.unlink()
 
 
-def build_model_aliases_json(explicit_json: str | None = None, upstream_model: str | None = None) -> str:
+def build_model_aliases_json(
+    explicit_json: str | None = None, upstream_model: str | None = None
+) -> str:
+    """Build the bridge model alias map JSON consumed by the proxy settings."""
     if explicit_json:
         return explicit_json
     aliases = dict(DEFAULT_ALIAS_MAP)
@@ -88,19 +102,37 @@ def classify_proxy_failure(
     method: str,
     request_kind: str | None = None,
 ) -> str | None:
+    """Collapse raw proxy outcomes into the dev-loop scoreboard categories.
+
+    The report uses these buckets to distinguish transport failures from schema,
+    unsupported-tool, upstream, and post-translation validation failures.
+    """
     if request_kind == "responses_websocket":
         return None if error_code is None else "transport_failure"
     if method == "GET":
         return "transport_failure"
     if error_code == "unsupported_tool":
         return "unsupported_tool"
-    if error_code in {"no_forwardable_tools", "hosted_tool_observed", "tool_definition_policy_error"}:
+    if error_code in {
+        "no_forwardable_tools",
+        "hosted_tool_observed",
+        "tool_definition_policy_error",
+    }:
         return "unsupported_tool"
-    if error_code in {"invalid_input", "unsupported_input_item", "request_validation_error", "request_parse_error"}:
+    if error_code in {
+        "invalid_input",
+        "unsupported_input_item",
+        "request_validation_error",
+        "request_parse_error",
+    }:
         return "schema_mismatch"
     if error_code and error_code.startswith("upstream_"):
         return "upstream_ollama_failure"
-    if error_code in {"invalid_tool_call", "ambiguous_tool_call", "unexpected_tool_call"}:
+    if error_code in {
+        "invalid_tool_call",
+        "ambiguous_tool_call",
+        "unexpected_tool_call",
+    }:
         return "proxy_validation_failure"
     if status_code and status_code >= 500:
         return "proxy_validation_failure"
@@ -110,10 +142,14 @@ def classify_proxy_failure(
 
 
 def log_bridge_event(log_dir: Path, payload: dict[str, Any]) -> None:
+    """Append one bridge lifecycle event to the run-events log."""
     append_jsonl(runs_log_path(log_dir), payload)
 
 
-def base_run_payload(run_id: str, mode: str, model: str, endpoint: str, binary: str) -> dict[str, Any]:
+def base_run_payload(
+    run_id: str, mode: str, model: str, endpoint: str, binary: str
+) -> dict[str, Any]:
+    """Build the shared metadata payload attached to each bridge event."""
     return {
         "timestamp": utc_now_iso(),
         "run_id": run_id,

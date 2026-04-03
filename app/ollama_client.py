@@ -9,18 +9,33 @@ from app.settings import Settings
 
 class OllamaClient:
     def __init__(self, settings: Settings) -> None:
+        """Create the shared async HTTP client used for upstream Ollama calls."""
         self._settings = settings
         self._client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
 
     async def close(self) -> None:
+        """Close the shared async HTTP client during app shutdown."""
         await self._client.aclose()
 
-    async def create_chat_completion(self, request: ChatCompletionsRequest) -> ChatCompletionsResponse:
+    async def create_chat_completion(
+        self, request: ChatCompletionsRequest
+    ) -> ChatCompletionsResponse:
+        """Send one translated chat completion request to Ollama and validate the reply.
+
+        This keeps transport failures, bad status codes, malformed JSON, and
+        schema mismatches mapped into the proxy's structured upstream errors.
+        """
         url = f"{self._settings.ollama_base_url}/v1/chat/completions"
         try:
-            response = await self._client.post(url, json=request.model_dump(mode="json", exclude_none=True))
+            response = await self._client.post(
+                url, json=request.model_dump(mode="json", exclude_none=True)
+            )
         except httpx.TimeoutException as exc:
-            raise UpstreamError("Timed out waiting for Ollama.", status_code=504, code="upstream_timeout") from exc
+            raise UpstreamError(
+                "Timed out waiting for Ollama.",
+                status_code=504,
+                code="upstream_timeout",
+            ) from exc
         except httpx.HTTPError as exc:
             raise UpstreamError(f"Failed to reach Ollama: {exc}") from exc
 
@@ -38,5 +53,11 @@ class OllamaClient:
             ) from exc
         try:
             return ChatCompletionsResponse.model_validate(payload)
-        except Exception as exc:  # pragma: no cover - narrow pydantic exception not needed here
-            raise ProxyError(502, "invalid_upstream_payload", f"Ollama payload validation failed: {exc}") from exc
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - narrow pydantic exception not needed here
+            raise ProxyError(
+                502,
+                "invalid_upstream_payload",
+                f"Ollama payload validation failed: {exc}",
+            ) from exc
