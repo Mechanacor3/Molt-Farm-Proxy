@@ -36,7 +36,7 @@ logger = logging.getLogger("molt_farm_proxy")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Create one shared Ollama client for the FastAPI app lifespan.
+    """Create one shared upstream chat client for the FastAPI app lifespan.
 
     This keeps connection setup centralized and makes test overrides simpler.
     """
@@ -50,7 +50,7 @@ app = FastAPI(title="Molt Farm Proxy", lifespan=lifespan)
 
 
 def get_ollama_client(request: Request) -> OllamaClient:
-    """Expose the lifespan-managed Ollama client through FastAPI DI."""
+    """Expose the lifespan-managed upstream client through FastAPI DI."""
     return request.app.state.ollama_client
 
 
@@ -352,7 +352,7 @@ async def _execute_responses_request(
     """Run the full proxy pipeline from Responses request to normalized output.
 
     The algorithm is: classify and filter tools, translate the request into the
-    upstream chat shape, call Ollama, then validate or repair any returned tool
+    upstream chat shape, call the upstream model, then validate or repair any returned tool
     calls before translating the result back into Responses semantics.
     """
     compatibility = build_tool_compatibility(
@@ -372,7 +372,10 @@ async def _execute_responses_request(
         "tool_choice": upstream_request.tool_choice,
     }
     started = perf_counter()
-    chat_response = await ollama_client.create_chat_completion(upstream_request)
+    chat_response = await ollama_client.create_chat_completion(
+        upstream_request,
+        authorization=getattr(state, "authorization_header", None),
+    )
     choice = chat_response.choices[0] if chat_response.choices else None
     if choice is not None:
         state.upstream_summary = {
@@ -431,6 +434,7 @@ async def request_logging_middleware(request: Request, call_next):
         if request.method == "POST" and request.url.path == "/v1/responses"
         else None
     )
+    request.state.authorization_header = request.headers.get("authorization")
 
     if request.url.path == "/v1/responses":
         raw_body = await request.body()
@@ -516,10 +520,19 @@ async def http_exception_handler(
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-@app.get("/healthz")
-async def healthz(settings: Settings = Depends(get_settings)) -> dict[str, str]:
+async def _health_payload(settings: Settings) -> dict[str, str]:
     """Report a minimal liveness payload plus the current default model."""
     return {"status": "ok", "default_model": settings.default_model}
+
+
+@app.get("/health")
+async def health(settings: Settings = Depends(get_settings)) -> dict[str, str]:
+    return await _health_payload(settings)
+
+
+@app.get("/healthz")
+async def healthz(settings: Settings = Depends(get_settings)) -> dict[str, str]:
+    return await _health_payload(settings)
 
 
 @app.get("/v1/responses", response_model=None)
@@ -561,6 +574,7 @@ async def responses_websocket(
     websocket.state.request_kind = "responses_websocket"
     websocket.state.status_code = 101
     websocket.state.websocket_status = "accepted"
+    websocket.state.authorization_header = websocket.headers.get("authorization")
     websocket.state.websocket_headers = _redact_websocket_headers(
         list(websocket.headers.items())
     )

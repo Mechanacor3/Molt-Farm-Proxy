@@ -21,6 +21,8 @@ sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
 OBSERVED_FULL_EXEC_SPEC = _MODULE.OBSERVED_FULL_EXEC_SPEC
+build_parser = _MODULE.build_parser
+build_request_headers = _MODULE.build_request_headers
 build_surface_unavailable_results = _MODULE.build_surface_unavailable_results
 build_case_matrix = _MODULE.build_case_matrix
 build_tool_presets = _MODULE.build_tool_presets
@@ -128,6 +130,31 @@ def test_extract_chat_function_call_normalizes_fields() -> None:
         "name": "exec_command",
         "arguments": '{"cmd":"pwd"}',
     }
+
+
+def test_build_request_headers_supports_optional_api_key() -> None:
+    """Probe helpers should add a bearer token only when requested."""
+    assert build_request_headers(None) == {"Content-Type": "application/json"}
+    assert build_request_headers("local-dev-key") == {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer local-dev-key",
+    }
+
+
+def test_build_parser_accepts_chat_base_url_and_legacy_alias() -> None:
+    """The probe CLI should accept the renamed chat flag and keep the old alias working."""
+    parser = build_parser()
+
+    renamed = parser.parse_args(
+        ["--surface", "chat", "--chat-base-url", "http://chat.test", "--api-key", "k"]
+    )
+    legacy = parser.parse_args(
+        ["--surface", "chat", "--ollama-base-url", "http://legacy.test"]
+    )
+
+    assert renamed.chat_base_url == "http://chat.test"
+    assert renamed.api_key == "k"
+    assert legacy.chat_base_url == "http://legacy.test"
 
 
 def test_summarize_flags_detects_strict_help_and_followup_success() -> None:

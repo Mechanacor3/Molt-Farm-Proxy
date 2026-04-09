@@ -27,6 +27,24 @@ def test_message_only_request_translates_to_chat() -> None:
     assert translated.stream is False
 
 
+def test_untyped_role_content_items_translate_to_chat_messages() -> None:
+    """SDK-style Responses inputs without explicit `type` should normalize to messages."""
+    request = ResponsesRequest(
+        model="alias-model",
+        input=[{"role": "user", "content": "hello"}],
+    )
+    settings = Settings(
+        default_model="nemotron-3-nano:4b",
+        model_aliases_json='{"alias-model":"real-model"}',
+    )
+
+    translated = translate_responses_request_to_chat(request, settings)
+
+    assert translated.model == "real-model"
+    assert translated.messages[0].role == "user"
+    assert translated.messages[0].content == "hello"
+
+
 def test_reasoning_and_tool_result_translate_to_chat() -> None:
     """Reasoning and tool-result items should map onto the expected chat roles."""
     request = ResponsesRequest(

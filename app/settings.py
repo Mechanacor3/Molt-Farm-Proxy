@@ -4,7 +4,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,7 +12,14 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MOLT_", extra="ignore")
 
     app_name: str = "Molt Farm Proxy"
-    ollama_base_url: str = "http://127.0.0.1:11434"
+    upstream_base_url: str = Field(
+        default="http://127.0.0.1:11434",
+        validation_alias=AliasChoices(
+            "MOLT_UPSTREAM_BASE_URL",
+            "MOLT_OLLAMA_BASE_URL",
+        ),
+    )
+    upstream_api_key: str | None = None
     default_model: str = "nemotron-3-nano:4b"
     model_aliases_json: str = Field(default="{}")
     request_timeout_seconds: float = 120.0
@@ -20,11 +27,20 @@ class Settings(BaseSettings):
     debug_tool_names: str | None = None
     log_dir: str = ".molt-logs"
 
-    @field_validator("ollama_base_url")
+    @field_validator("upstream_base_url")
     @classmethod
     def strip_trailing_slash(cls, value: str) -> str:
         """Normalize the Ollama base URL so request joins stay predictable."""
         return value.rstrip("/")
+
+    @field_validator("upstream_api_key")
+    @classmethod
+    def blank_api_key_to_none(cls, value: str | None) -> str | None:
+        """Treat blank upstream keys as unset so auth forwarding can take over."""
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
     @property
     def model_aliases(self) -> dict[str, str]:

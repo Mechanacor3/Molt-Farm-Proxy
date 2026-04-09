@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.devloop import request_log_path
 from app.main import app, get_ollama_client
+from app.ollama_client import _authorization_headers
 from app.schemas_chat import ChatCompletionsRequest, ChatCompletionsResponse
 from app.settings import get_settings
 
@@ -18,16 +19,21 @@ class FakeOllamaClient:
         """Store the canned payload and remember the last request for assertions."""
         self.payload = payload
         self.last_request: ChatCompletionsRequest | None = None
+        self.last_authorization: str | None = None
 
     async def close(self) -> None:
         """Match the real client shutdown API without doing any work."""
         return None
 
     async def create_chat_completion(
-        self, request: ChatCompletionsRequest
+        self,
+        request: ChatCompletionsRequest,
+        *,
+        authorization: str | None = None,
     ) -> ChatCompletionsResponse:
         """Capture the translated request and return the canned upstream payload."""
         self.last_request = request
+        self.last_authorization = authorization
         return ChatCompletionsResponse.model_validate(self.payload)
 
 
@@ -80,6 +86,38 @@ def test_healthz(client: TestClient) -> None:
     assert response.json()["status"] == "ok"
 
 
+def test_health_alias_matches_healthz(client: TestClient) -> None:
+    """The `/health` alias should match the existing liveness payload."""
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+def test_settings_prefer_upstream_base_url_over_legacy_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The new generic upstream env should win when both names are present."""
+    monkeypatch.setenv("MOLT_UPSTREAM_BASE_URL", "http://upstream.example")
+    monkeypatch.setenv("MOLT_OLLAMA_BASE_URL", "http://legacy.example")
+    get_settings.cache_clear()
+
+    settings = get_settings()
+
+    assert settings.upstream_base_url == "http://upstream.example"
+
+
+def test_settings_still_accept_legacy_ollama_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy upstream env should still configure the proxy when used alone."""
+    monkeypatch.setenv("MOLT_OLLAMA_BASE_URL", "http://legacy.example")
+    get_settings.cache_clear()
+
+    settings = get_settings()
+
+    assert settings.upstream_base_url == "http://legacy.example"
+
+
 def test_non_streaming_response(client: TestClient) -> None:
     """A basic non-streaming Responses request should round-trip to text output."""
     response = client.post("/v1/responses", json={"input": "ping", "stream": False})
@@ -87,6 +125,28 @@ def test_non_streaming_response(client: TestClient) -> None:
     body = response.json()
     assert body["object"] == "response"
     assert body["output"][0]["content"][0]["text"] == "pong"
+
+
+def test_incoming_authorization_is_forwarded_when_no_upstream_api_key(
+    client: TestClient,
+) -> None:
+    """Client auth should be forwarded upstream when no explicit upstream key is set."""
+    response = client.post(
+        "/v1/responses",
+        json={"input": "ping", "stream": False},
+        headers={"Authorization": "Bearer forwarded-key"},
+    )
+
+    assert response.status_code == 200
+    assert client.fake_ollama.last_authorization == "Bearer forwarded-key"  # type: ignore[attr-defined]
+
+
+def test_authorization_headers_prefer_explicit_upstream_api_key() -> None:
+    """The upstream API key should override any forwarded client auth."""
+    assert _authorization_headers(
+        upstream_api_key="upstream-secret",
+        incoming_authorization="Bearer forwarded-key",
+    ) == {"Authorization": "Bearer upstream-secret"}
 
 
 def test_streaming_response_returns_final_sse(client: TestClient) -> None:

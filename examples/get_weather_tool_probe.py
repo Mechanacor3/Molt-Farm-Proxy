@@ -29,10 +29,12 @@ def send_response_request(
     base_url: str,
     model: str,
     input_items: str | list[dict[str, Any]],
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     """Send one non-streaming request to the proxy Responses endpoint."""
     response = client.post(
         f"{base_url}/v1/responses",
+        headers=build_request_headers(api_key),
         json={
             "model": model,
             "stream": False,
@@ -51,10 +53,12 @@ def send_chat_request(
     base_url: str,
     model: str,
     messages: list[dict[str, Any]],
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     """Send one non-streaming request directly to chat completions."""
     response = client.post(
         f"{base_url}/v1/chat/completions",
+        headers=build_request_headers(api_key),
         json={
             "model": model,
             "stream": False,
@@ -66,6 +70,14 @@ def send_chat_request(
     )
     response.raise_for_status()
     return response.json()
+
+
+def build_request_headers(api_key: str | None) -> dict[str, str]:
+    """Build the optional auth header for authenticated local backends."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def first_function_call(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -121,9 +133,10 @@ def run_responses_mode(
     model: str,
     prompt: str,
     tool_output: dict[str, Any],
+    api_key: str | None = None,
 ) -> None:
     """Exercise the proxy Responses surface and print both turns."""
-    first = send_response_request(client, base_url, model, prompt)
+    first = send_response_request(client, base_url, model, prompt, api_key)
     print("=== First response ===")
     print(json.dumps(first, indent=2))
 
@@ -138,7 +151,7 @@ def run_responses_mode(
     print(f"arguments: {call['arguments']}")
 
     followup_input = build_responses_followup_input(prompt, call, tool_output)
-    second = send_response_request(client, base_url, model, followup_input)
+    second = send_response_request(client, base_url, model, followup_input, api_key)
     print("\n=== Second response with fake tool output ===")
     print(json.dumps(second, indent=2))
 
@@ -149,6 +162,7 @@ def run_chat_mode(
     model: str,
     prompt: str,
     tool_output: dict[str, Any],
+    api_key: str | None = None,
 ) -> None:
     """Exercise the direct chat surface and print both turns."""
     first = send_chat_request(
@@ -156,6 +170,7 @@ def run_chat_mode(
         base_url,
         model,
         [{"role": "user", "content": prompt}],
+        api_key,
     )
     print("=== First response ===")
     print(json.dumps(first, indent=2))
@@ -188,13 +203,14 @@ def run_chat_mode(
                 "content": json.dumps(tool_output),
             },
         ],
+        api_key,
     )
     print("\n=== Second response with fake tool output ===")
     print(json.dumps(second, indent=2))
 
 
-def main() -> None:
-    """Run the selected weather probe mode with a fake tool result payload."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser so tests can lock the probe's public flags."""
     parser = argparse.ArgumentParser(
         description="Probe the proxy with one get_weather function tool."
     )
@@ -212,6 +228,11 @@ def main() -> None:
         default="codex-bridge",
         help="Model name to send in the Responses request.",
     )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Optional bearer token for authenticated local or proxied backends.",
+    )
     parser.add_argument("--city", default="Boston", help="City to ask about.")
     parser.add_argument(
         "--prompt",
@@ -223,6 +244,12 @@ def main() -> None:
         default='{"temp_f": 61, "condition": "sunny"}',
         help="JSON payload to return if the model calls get_weather.",
     )
+    return parser
+
+
+def main() -> None:
+    """Run the selected weather probe mode with a fake tool result payload."""
+    parser = build_parser()
     args = parser.parse_args()
 
     prompt = args.prompt.format(city=args.city)
@@ -235,9 +262,23 @@ def main() -> None:
 
     with httpx.Client() as client:
         if args.mode == "responses":
-            run_responses_mode(client, base_url, args.model, prompt, tool_output)
+            run_responses_mode(
+                client,
+                base_url,
+                args.model,
+                prompt,
+                tool_output,
+                args.api_key,
+            )
         else:
-            run_chat_mode(client, base_url, args.model, prompt, tool_output)
+            run_chat_mode(
+                client,
+                base_url,
+                args.model,
+                prompt,
+                tool_output,
+                args.api_key,
+            )
 
 
 if __name__ == "__main__":

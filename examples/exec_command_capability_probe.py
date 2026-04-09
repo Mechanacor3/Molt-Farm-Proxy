@@ -223,10 +223,12 @@ def send_responses_request(
     model: str,
     tool_spec: dict[str, Any],
     input_items: str | list[dict[str, Any]],
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     """Send one non-streaming probe request to the proxy Responses endpoint."""
     response = client.post(
         f"{base_url}/v1/responses",
+        headers=build_request_headers(api_key),
         json={
             "model": model,
             "stream": False,
@@ -246,10 +248,12 @@ def send_chat_request(
     model: str,
     tool_spec: dict[str, Any],
     messages: list[dict[str, Any]],
+    api_key: str | None = None,
 ) -> dict[str, Any]:
     """Send one non-streaming probe request to the upstream chat endpoint."""
     response = client.post(
         f"{base_url}/v1/chat/completions",
+        headers=build_request_headers(api_key),
         json={
             "model": model,
             "stream": False,
@@ -261,6 +265,14 @@ def send_chat_request(
     )
     response.raise_for_status()
     return response.json()
+
+
+def build_request_headers(api_key: str | None) -> dict[str, str]:
+    """Build the optional auth header for authenticated direct or proxied probes."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
 
 def extract_responses_function_call(payload: dict[str, Any]) -> dict[str, str] | None:
@@ -367,6 +379,7 @@ def run_case(
     model: str,
     base_url: str,
     case: ProbeCase,
+    api_key: str | None = None,
     verbose: bool = False,
 ) -> dict[str, Any]:
     """Execute one probe case and capture normalized success diagnostics.
@@ -402,6 +415,7 @@ def run_case(
                 model,
                 tool_spec,
                 [{"role": "user", "content": prompt}],
+                api_key,
             )
             call = extract_chat_function_call(first)
             result["first_finish_reason"] = extract_chat_finish_reason(first)
@@ -421,6 +435,7 @@ def run_case(
                         model,
                         tool_spec,
                         build_chat_followup_messages(prompt, call, case.fake_stdout),
+                        api_key,
                     )
                     result["followup_success"] = True
                     if verbose:
@@ -432,7 +447,14 @@ def run_case(
                     result["error"] = f"http_{exc.response.status_code}: {detail}"
             return result
 
-        first = send_responses_request(client, base_url, model, tool_spec, prompt)
+        first = send_responses_request(
+            client,
+            base_url,
+            model,
+            tool_spec,
+            prompt,
+            api_key,
+        )
         call = extract_responses_function_call(first)
         if verbose:
             result["first_response"] = first
@@ -448,6 +470,7 @@ def run_case(
                 model,
                 tool_spec,
                 build_responses_followup_input(prompt, call, case.fake_stdout),
+                api_key,
             )
             result["followup_success"] = True
             if verbose:
@@ -603,10 +626,10 @@ def case_by_name_keys() -> list[str]:
     return sorted(CASES_BY_NAME)
 
 
-def main() -> None:
-    """Run the selected probe cases and print JSON or a human summary."""
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser so tests can lock the public probe flags."""
     parser = argparse.ArgumentParser(
-        description="Probe narrow exec_command tool variants against Ollama and the proxy."
+        description="Probe narrow exec_command tool variants against direct chat and the proxy."
     )
     parser.add_argument(
         "--surface", choices=["chat", "responses", "both"], default="both"
@@ -616,8 +639,18 @@ def main() -> None:
         default="nemotron-3-nano:4b",
         help="Model name to send for each request.",
     )
-    parser.add_argument("--ollama-base-url", default="http://127.0.0.1:11434")
+    parser.add_argument(
+        "--chat-base-url",
+        "--ollama-base-url",
+        dest="chat_base_url",
+        default="http://127.0.0.1:11434",
+    )
     parser.add_argument("--proxy-base-url", default="http://127.0.0.1:8000")
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="Optional bearer token for authenticated local or proxied backends.",
+    )
     parser.add_argument("--case", choices=["all", *case_by_name_keys()], default="all")
     parser.add_argument(
         "--json", action="store_true", help="Print the full results as JSON."
@@ -627,6 +660,12 @@ def main() -> None:
         action="store_true",
         help="Include raw response payloads in the results.",
     )
+    return parser
+
+
+def main() -> None:
+    """Run the selected probe cases and print JSON or a human summary."""
+    parser = build_parser()
     args = parser.parse_args()
 
     selected_cases = resolve_cases(args.case)
@@ -634,7 +673,7 @@ def main() -> None:
     with httpx.Client() as client:
         for surface in resolve_surfaces(args.surface):
             base_url = (
-                args.ollama_base_url if surface == "chat" else args.proxy_base_url
+                args.chat_base_url if surface == "chat" else args.proxy_base_url
             )
             preflight_error = preflight_surface(client, surface, base_url)
             if preflight_error is not None:
@@ -652,6 +691,7 @@ def main() -> None:
                         model=args.model,
                         base_url=base_url,
                         case=case,
+                        api_key=args.api_key,
                         verbose=args.verbose,
                     )
                 )

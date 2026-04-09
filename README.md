@@ -1,7 +1,7 @@
 # Molt Farm Proxy
 
 FastAPI proxy that accepts OpenAI Responses API requests and translates them to
-Ollama chat completions.
+an upstream OpenAI-compatible chat-completions endpoint.
 
 ## Install `uv`
 
@@ -35,13 +35,35 @@ expected interpreter family by default.
 
 ## Start The Proxy
 
-Run the bridge-friendly proxy with the local Ollama-backed model aliases:
+Run the bridge-friendly proxy with the local model aliases:
 
 ```bash
 uv run molt-proxy-dev --reload
 ```
 
 By default this starts the FastAPI proxy on `http://127.0.0.1:8000`.
+
+### Gemma On llama.cpp
+
+To front a local authenticated `llama.cpp` server instead of Ollama, point the
+proxy at the root server URL and provide the upstream bearer token:
+
+```bash
+env \
+  MOLT_UPSTREAM_BASE_URL=http://127.0.0.1:8080 \
+  MOLT_UPSTREAM_API_KEY=local-dev-key \
+  uv run molt-proxy-dev --host 127.0.0.1 --port 8000 --upstream-model gemma-4-e4b
+```
+
+Health checks:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl -i http://127.0.0.1:8000/v1/responses
+```
+
+The proxy intentionally returns `405` from `GET /v1/responses`; that is the
+expected preflight shape for a healthy Responses surface.
 
 ## Tight Dev Loop
 
@@ -57,7 +79,8 @@ uv run codex-bridge-report --limit 5
 `~/.codex/config.toml` unchanged and writes JSONL run logs to `.molt-logs/`.
 
 `molt-proxy-dev` starts the FastAPI proxy with bridge-friendly model aliases so
-default Codex model names such as `gpt-5.4` route to the local Ollama model.
+default Codex model names such as `gpt-5.4` route to the configured local
+upstream model.
 
 ## Continuation Tests
 
@@ -91,26 +114,49 @@ That script sends a single `get_weather` function tool to `POST /v1/responses`,
 prints the first response, and if the model emits a function call it posts a
 fake tool result back on a second turn.
 
-To hit Ollama directly instead of the proxy:
+To hit the upstream chat-completions server directly instead of the proxy:
 
 ```bash
-uv run python examples/get_weather_tool_probe.py --mode chat --model nemotron-3-nano:4b
+uv run python examples/get_weather_tool_probe.py \
+  --mode chat \
+  --model gemma-4-e4b \
+  --base-url http://127.0.0.1:8080 \
+  --api-key local-dev-key
+```
+
+Probe the proxy-backed Responses path against the same Gemma server:
+
+```bash
+uv run python examples/get_weather_tool_probe.py \
+  --mode responses \
+  --model gemma-4-e4b \
+  --base-url http://127.0.0.1:8000 \
+  --api-key local-dev-key
 ```
 
 Probe how far a narrower `exec_command` definition makes it through against
-direct Ollama chat and proxy Responses:
+direct chat and proxy Responses:
 
 ```bash
-uv run python examples/exec_command_capability_probe.py --model nemotron-3-nano:4b
+uv run python examples/exec_command_capability_probe.py \
+  --model gemma-4-e4b \
+  --chat-base-url http://127.0.0.1:8080 \
+  --proxy-base-url http://127.0.0.1:8000 \
+  --api-key local-dev-key
 ```
 
-`--surface chat` talks straight to Ollama. `--surface responses` and
+`--surface chat` talks straight to the upstream chat endpoint. `--surface responses` and
 `--surface both` expect the proxy to be running on `http://127.0.0.1:8000`.
 
 For machine-readable pass/fail flags:
 
 ```bash
-uv run python examples/exec_command_capability_probe.py --model nemotron-3-nano:4b --json
+uv run python examples/exec_command_capability_probe.py \
+  --model gemma-4-e4b \
+  --chat-base-url http://127.0.0.1:8080 \
+  --proxy-base-url http://127.0.0.1:8000 \
+  --api-key local-dev-key \
+  --json
 ```
 
 See the agent/operator guide:

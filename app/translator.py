@@ -4,6 +4,8 @@ import json
 from typing import Any
 from uuid import uuid4
 
+from pydantic import ValidationError
+
 from app.errors import ProxyError
 from app.schemas_chat import (
     ChatCompletionsRequest,
@@ -34,7 +36,18 @@ def _item_to_model(item: ResponseInputItem | dict[str, Any]) -> ResponseInputIte
     """Normalize mixed input entries into the shared pydantic model."""
     if isinstance(item, ResponseInputItem):
         return item
-    return ResponseInputItem.model_validate(item)
+    normalized = item
+    if isinstance(item, dict) and "type" not in item:
+        if "role" in item and "content" in item:
+            normalized = {"type": "message", **item}
+    try:
+        return ResponseInputItem.model_validate(normalized)
+    except ValidationError as exc:
+        raise ProxyError(
+            400,
+            "invalid_input",
+            "Responses input items must include a supported type or a message role/content pair.",
+        ) from exc
 
 
 def _extract_text(
